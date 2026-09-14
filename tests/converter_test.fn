@@ -1,0 +1,246 @@
+package transcript.converter
+
+import std.json
+import std.text
+
+fn sessionLine() String {
+    "{\"timestamp\":\"t0\",\"type\":\"session_meta\",\"payload\":" +
+        "{\"id\":\"codex-1\",\"cwd\":\"/work\",\"git\":{\"branch\":\"main\"}}}"
+}
+
+fn userLine(kind String, body String) String {
+    "{\"timestamp\":\"t1\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\"," +
+        "\"id\":\"m1\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"" +
+        body + "\"}],\"internal_chat_message_metadata_passthrough\":" +
+        "{\"content_item_kinds\":[\"" + kind + "\"]}}}"
+}
+
+fn feed(&conv converter, line String, number u64) void {
+    if text.IsEmpty(line) return
+    conv.Accept(line, number) else error {
+        panic(error.message)
+    }
+}
+
+fn convertAll(first String, second String, third String, fourth String) own converter {
+    const id = "00000000-0000-8000-8000-000000000000"
+    var conv = newConverter(id, "/out/session.jsonl", "Thread title")
+    feed(&conv, first, 1)
+    feed(&conv, second, 2)
+    feed(&conv, third, 3)
+    feed(&conv, fourth, 4)
+    conv.Finish() else {
+        fail("finish failed")
+    }
+    conv
+}
+
+fn nextRecord(&conv converter) own json.Object {
+    const next = conv.Next()
+    match next {
+        None: fail("a record is missing")
+        Some(line): {
+            const parsed = parseLine(line, 0) else {
+                fail("a record is not a JSON object")
+            }
+            parsed
+        }
+    }
+}
+
+fn firstBlock(&record json.Object) own json.Object {
+    var message = takeObject(&record, "message")
+    var content = takeArray(&message, "content")
+    const first = content.PopFront()
+    match first {
+        None: fail("the message has no content")
+        Some(value): objectOf($value)
+    }
+}
+
+fn isTrue(&record json.Object, key String) bool {
+    const found = record.Take(key)
+    match found {
+        Some(value): match value {
+            Bool(state): state
+            _: false
+        }
+        None: false
+    }
+}
+
+test "typed prompts and injected context stay apart" {
+    var conv = convertAll(
+        sessionLine(),
+        userLine("user.text", "hello"),
+        userLine("goal.internal_context", "keep going"),
+        ""
+    )
+    var notice = nextRecord(&conv)
+    expect(takeText(&notice, "subtype") == "informational")
+    expect(takeText(&notice, "gitBranch") == "main")
+    var prompt = nextRecord(&conv)
+    expect(takeText(&prompt, "type") == "user")
+    expect(!isTrue(&prompt, "isMeta"))
+    expect(takeText(&prompt, "parentUuid") == takeText(&notice, "uuid"))
+    var block = firstBlock(&prompt)
+    expect(takeText(&block, "text") == "hello")
+    var context = nextRecord(&conv)
+    expect(isTrue(&context, "isMeta"))
+    expect(takeText(&context, "cwd") == "/work")
+}
+
+test "tool calls pair with their results and usage" {
+    var conv = convertAll(
+        sessionLine(),
+        "{\"timestamp\":\"t2\",\"type\":\"response_item\",\"payload\":{\"type\":" +
+        "\"custom_tool_call\",\"id\":\"c1\",\"call_id\":\"call_1\",\"name\":\"exec\"," +
+        "\"input\":\"run()\"}}",
+        "{\"timestamp\":\"t3\",\"type\":\"token_usage_record\",\"payload\":{\"response_id\":" +
+        "\"resp_1\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":40," +
+        "\"output_tokens\":7}}}",
+        "{\"timestamp\":\"t4\",\"type\":\"response_item\",\"payload\":{\"type\":" +
+        "\"custom_tool_call_output\",\"call_id\":\"call_1\",\"output\":[{\"type\":" +
+        "\"input_text\",\"text\":\"done\"}]}}"
+    )
+    var notice = nextRecord(&conv)
+    discard notice
+    var call = nextRecord(&conv)
+    var message = takeObject(&call, "message")
+    expect(takeText(&message, "id") == "resp_1")
+    expect(takeText(&message, "stop_reason") == "tool_use")
+    var usage = takeObject(&message, "usage")
+    expect(takeNumber(&usage, "input_tokens") == "60")
+    expect(takeNumber(&usage, "cache_read_input_tokens") == "40")
+    var content = takeArray(&message, "content")
+    const first = content.PopFront()
+    var use = match first {
+        None: fail("the call has no block")
+        Some(value): objectOf($value)
+    }
+    expect(takeText(&use, "id") == "call_1")
+    var input = takeObject(&use, "input")
+    expect(takeText(&input, "input") == "run()")
+    var result = nextRecord(&conv)
+    expect(takeText(&result, "sourceToolAssistantUUID") == takeText(&call, "uuid"))
+    var block = firstBlock(&result)
+    expect(takeText(&block, "type") == "tool_result")
+    expect(takeText(&block, "tool_use_id") == "call_1")
+}
+
+test "compaction boundaries are found by the resume scanner" {
+    var conv = convertAll(
+        sessionLine(),
+        userLine("user.text", "first"),
+        "{\"timestamp\":\"t5\",\"type\":\"compacted\",\"payload\":{\"replacement_history\":[" +
+        "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\"," +
+        "\"text\":\"first\"}]},{\"type\":\"compaction\",\"encrypted_content\":\"x\"}]," +
+        "\"latest_token_usage_record\":{\"usage\":{\"input_tokens\":900}}}}",
+        ""
+    )
+    var notice = nextRecord(&conv)
+    discard notice
+    var prompt = nextRecord(&conv)
+    const line = conv.Next()
+    const raw = match line {
+        None: fail("the boundary is missing")
+        Some(value): value
+    }
+    const head = text.Slice(raw, 0, 256) else {
+        fail("the boundary line is shorter than 256 bytes")
+    }
+    expect(text.Contains(head, "\"compact_boundary\""))
+    expect(text.StartsWith(raw, "{\"parentUuid\":null,\"logicalParentUuid\":\""))
+    const parsedBoundary = parseLine(raw, 0) else {
+        fail("the boundary is not JSON")
+    }
+    var boundary = parsedBoundary
+    expect(takeText(&boundary, "logicalParentUuid") == takeText(&prompt, "uuid"))
+    var metadata = takeObject(&boundary, "compactMetadata")
+    expect(takeNumber(&metadata, "preTokens") == "900")
+    var kept = nextRecord(&conv)
+    expect(takeText(&kept, "parentUuid") == takeText(&boundary, "uuid"))
+    var summary = nextRecord(&conv)
+    expect(isTrue(&summary, "isCompactSummary"))
+    var note = firstBlock(&summary)
+    expect(text.Contains(takeText(&note, "text"), "/out/session.jsonl"))
+}
+
+test "data URL images become base64 blocks" {
+    var source = imageSource("data:image/png;base64,AAAA")
+    expect(takeText(&source, "type") == "base64")
+    expect(takeText(&source, "media_type") == "image/png")
+    expect(takeText(&source, "data") == "AAAA")
+    var remote = imageSource("https://example.com/a.png")
+    expect(takeText(&remote, "type") == "url")
+}
+
+test "blank text parts are dropped" {
+    var parts = json.NewArray()
+    var blank = json.NewObject()
+    put(&blank, "type", .Text("input_text"))
+    put(&blank, "text", .Text(" \n"))
+    parts.Add(.Object(blank))
+    const blocks = convertParts($parts) else {
+        fail("conversion failed")
+    }
+    expect(blocks.Len() == 0)
+}
+
+test "reasoning keeps only readable summaries" {
+    var conv = convertAll(
+        sessionLine(),
+        "{\"timestamp\":\"t6\",\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\"," +
+        "\"id\":\"r1\",\"summary\":[],\"encrypted_content\":\"x\"}}",
+        "{\"timestamp\":\"t7\",\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\"," +
+        "\"id\":\"r2\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"plan\"}]}}",
+        ""
+    )
+    expect(conv.counts.encryptedReasoning == 1)
+    expect(conv.counts.thinking == 1)
+    var notice = nextRecord(&conv)
+    discard notice
+    var thinking = nextRecord(&conv)
+    var block = firstBlock(&thinking)
+    expect(takeText(&block, "type") == "thinking")
+    expect(takeText(&block, "thinking") == "plan")
+}
+
+test "function arguments become structured tool input" {
+    var input = functionInput("{\"duration_ms\":5}")
+    expect(takeNumber(&input, "duration_ms") == "5")
+    var raw = functionInput("not json")
+    expect(takeText(&raw, "arguments") == "not json")
+    expect(toolName("mcp__cua_repl", "js") == "mcp__cua_repl__js")
+    expect(toolName("", "exec") == "exec")
+}
+
+test "the transcript ends with the records the session list reads" {
+    var conv = convertAll(
+        sessionLine(),
+        userLine("user.text", "first"),
+        userLine("goal.internal_context", "keep going"),
+        userLine("user.text", "second")
+    )
+    var notice = nextRecord(&conv)
+    discard notice
+    var first = nextRecord(&conv)
+    discard first
+    var context = nextRecord(&conv)
+    discard context
+    var second = nextRecord(&conv)
+    var title = nextRecord(&conv)
+    expect(takeText(&title, "type") == "ai-title")
+    expect(takeText(&title, "aiTitle") == "Thread title")
+    var prompt = nextRecord(&conv)
+    expect(takeText(&prompt, "type") == "last-prompt")
+    expect(takeText(&prompt, "lastPrompt") == "second")
+    expect(takeText(&prompt, "leafUuid") == takeText(&second, "uuid"))
+    match conv.Next() {
+        None: {}
+        Some(extra): {
+            discard extra
+            fail("a record follows the session list records")
+        }
+    }
+}

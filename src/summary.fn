@@ -1,0 +1,63 @@
+package transcript.converter
+
+import std.format
+
+struct tally {
+    lines u64 = 0
+    records u64 = 0
+    prompts u64 = 0
+    context u64 = 0
+    assistant u64 = 0
+    thinking u64 = 0
+    toolCalls u64 = 0
+    toolResults u64 = 0
+    compactions u64 = 0
+    summaries u64 = 0
+    notices u64 = 0
+    durations u64 = 0
+    attached u64 = 0
+    encryptedReasoning u64 = 0
+    snapshots u64 = 0
+    usage u64 = 0
+    settings u64 = 0
+    events u64 = 0
+    mirrored u64 = 0
+    unknown u64 = 0
+    truncated u64 = 0
+    metadata u64 = 0
+}
+
+fn countLine(label String, value u64) String {
+    "  " + label + " " + format.U64(value) + "\n"
+}
+
+fn render(counts tally, source String, destination String, sessionID String) String {
+    "converted " + source + "\n" +
+        "into " + destination + "\n" +
+        "claude session " + sessionID + "\n" +
+        "records\n" +
+        countLine("codex lines read", counts.lines) +
+        countLine("claude records written", counts.records) +
+        countLine("user prompts", counts.prompts) +
+        countLine("injected context messages", counts.context) +
+        countLine("assistant records", counts.assistant) +
+        countLine("reasoning summaries as thinking", counts.thinking) +
+        countLine("tool calls", counts.toolCalls) +
+        countLine("tool results", counts.toolResults) +
+        countLine("tool activity items attached to results", counts.attached) +
+        countLine("compaction boundaries", counts.compactions) +
+        countLine("compaction notes", counts.summaries) +
+        countLine("turn durations", counts.durations) +
+        countLine("transcript notices", counts.notices) +
+        countLine("session list records", counts.metadata) +
+        "not representable in Claude\n" +
+        countLine("encrypted reasoning without summary", counts.encryptedReasoning) +
+        "absorbed into other records\n" +
+        countLine("token usage records", counts.usage) +
+        countLine("turn contexts", counts.settings) +
+        countLine("interface mirrors of converted items", counts.mirrored) +
+        countLine("context snapshots rendered as messages", counts.snapshots) +
+        countLine("status events", counts.events) +
+        countLine("unrecognized lines", counts.unknown) +
+        countLine("incomplete final line", counts.truncated)
+}

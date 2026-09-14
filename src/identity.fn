@@ -1,0 +1,46 @@
+package transcript.converter
+
+import std.bytes
+import std.text
+
+// Derives a version 8 UUID from the SHA-256 digest of seed. Deriving every
+// identifier from the source makes a repeated conversion byte-identical.
+fn derivedUUID(seed String) String {
+    var digest = bytes.NewSha256()
+    digest.WriteText(seed) else {
+        panic("identifier digest rejected its seed")
+    }
+    const value = digest.Finish() else {
+        panic("identifier digest closed early")
+    }
+    var builder = text.NewBuilder()
+    var index u64 = 0
+    while index < 16 {
+        const byte = value.At(index) else {
+            panic("identifier digest is shorter than 16 bytes")
+        }
+        if index == 4 || index == 6 || index == 8 || index == 10 {
+            append(&builder, "-")
+        }
+        const shaped = shapeByte(index, byte)
+        writeHex(&builder, shaped / 16)
+        writeHex(&builder, shaped % 16)
+        index = index + 1
+    }
+    const result = builder.Finish() else {
+        panic("identifier builder closed early")
+    }
+    result
+}
+
+// Applies the RFC 9562 version 8 and variant bits.
+fn shapeByte(index u64, value u64) u64 {
+    if index == 6 return (value & 15) | 128
+    if index == 8 return (value & 63) | 128
+    value
+}
+
+fn writeHex(&builder text.Builder, digit u64) void {
+    const code = digit + 48 if digit < 10 else digit + 87
+    discard builder.WriteCodePoint(code)
+}

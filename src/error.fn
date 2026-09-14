@@ -1,0 +1,20 @@
+package transcript.converter
+
+import std.text
+
+enum failureKind {
+    InvalidArguments
+    SourceUnavailable
+    InvalidSource
+    MalformedRecord
+    OutputUnavailable
+}
+
+struct failure {
+    kind failureKind
+    message String
+}
+
+fn fault(kind failureKind, message String) failure {
+    failure { kind = kind message = text.Copy(message) }
+}

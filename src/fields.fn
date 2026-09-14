@@ -1,0 +1,105 @@
+package transcript.converter
+
+import std.format
+import std.json
+import std.parse
+import std.text
+
+fn parseLine(line String, number u64) Result<own json.Object, failure> {
+    const parsed = json.Parse(line) else {
+        return .Err(fault(.MalformedRecord, "line " + format.U64(number) + " is not valid JSON"))
+    }
+    match parsed {
+        Object(object): .Ok(object)
+        _: .Err(fault(.MalformedRecord, "line " + format.U64(number) + " is not an object"))
+    }
+}
+
+fn put(&object json.Object, $key String, $value json.Value) void {
+    object.Set($key, $value) else {
+        panic("a converted object received a duplicate key")
+    }
+}
+
+fn textOf($value json.Value) String {
+    match value {
+        Text(content): content
+        _: ""
+    }
+}
+
+fn takeText(&object json.Object, key String) String {
+    const found = object.Take(key)
+    match found {
+        None: ""
+        Some(value): textOf($value)
+    }
+}
+
+// Reads a text field and leaves it in place for the provenance payload.
+fn peekText(&object json.Object, key String) String {
+    const found = takeText(&object, key)
+    if !text.IsEmpty(found) {
+        put(&object, text.Copy(key), .Text(text.Copy(found)))
+    }
+    found
+}
+
+fn takeNumber(&object json.Object, key String) String {
+    const found = object.Take(key)
+    match found {
+        None: ""
+        Some(value): match value {
+            Number(spelling): spelling
+            _: ""
+        }
+    }
+}
+
+fn peekNumber(&object json.Object, key String) String {
+    const found = takeNumber(&object, key)
+    if !text.IsEmpty(found) {
+        put(&object, text.Copy(key), .Number(text.Copy(found)))
+    }
+    found
+}
+
+fn countOf(spelling String) u64 {
+    const count = parse.U64(spelling) else {
+        return 0
+    }
+    count
+}
+
+fn objectOf($value json.Value) own json.Object {
+    match value {
+        Object(inner): inner
+        _: json.NewObject()
+    }
+}
+
+fn takeObject(&object json.Object, key String) own json.Object {
+    const found = object.Take(key)
+    match found {
+        None: json.NewObject()
+        Some(value): objectOf($value)
+    }
+}
+
+fn takeArray(&object json.Object, key String) own json.Array {
+    const found = object.Take(key)
+    match found {
+        None: json.NewArray()
+        Some(value): match value {
+            Array(inner): inner
+            _: json.NewArray()
+        }
+    }
+}
+
+// Restores a nested object only when the source carried one.
+fn restoreObject(&object json.Object, key String, $value own json.Object) void {
+    if value.Len() > 0 {
+        put(&object, text.Copy(key), .Object(value))
+    }
+}

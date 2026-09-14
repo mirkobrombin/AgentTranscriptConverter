@@ -1,0 +1,49 @@
+package transcript.converter
+
+import std.text
+
+test "derived identifiers are stable version 8 UUIDs" {
+    const first = derivedUUID("codex/session")
+    const second = derivedUUID("codex/session")
+    expect(first == second)
+    expect(first != derivedUUID("codex/other"))
+    expect(text.ByteLen(first) == 36)
+    const version = text.Slice(first, 14, 15) else {
+        fail("identifier is too short")
+    }
+    expect(version == "8")
+    const parsed = UUID.Parse(first) else {
+        fail("identifier does not parse")
+    }
+    expect(parsed.String() == first)
+}
+
+test "project folders follow Claude Code naming" {
+    const plain = projectFolder("/home/user/Projects/Example") else {
+        fail("plain folder failed")
+    }
+    expect(plain == "-home-user-Projects-Example")
+    const accented = projectFolder("/tmp/café.d") else {
+        fail("accented folder failed")
+    }
+    expect(accented == "-tmp-caf--d")
+}
+
+test "options accept one source and a session id" {
+    const id = "0190A000-0000-7000-8000-000000000001"
+    const parsed = parseOptions(["abc.jsonl", "--session-id", id]) else {
+        fail("valid options were rejected")
+    }
+    expect(parsed.source == "abc.jsonl")
+    expect(parsed.sessionID == "0190a000-0000-7000-8000-000000000001")
+    match parseOptions(["a.jsonl", "b.jsonl"]) {
+        Ok(value): {
+            discard value
+            fail("a second source was accepted")
+        }
+        Err(error): match error.kind {
+            InvalidArguments: {}
+            _: fail("wrong error for a second source")
+        }
+    }
+}

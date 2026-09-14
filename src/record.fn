@@ -1,0 +1,66 @@
+package transcript.converter
+
+import std.json
+import std.text
+
+// One Claude transcript line whose top-level keys keep their insertion order.
+// Claude Code recognizes a compaction boundary only when the literal
+// "compact_boundary" appears in the first 256 bytes of its line, so records are
+// not passed through the key-sorting std.json writer as a whole.
+struct record {
+    builder own text.Builder
+    empty bool
+
+    fn raw(&self, key String, value String) void {
+        const separator = "{" if self.empty else ","
+        append(&self.builder, separator + "\"" + key + "\":" + value)
+        self.empty = false
+    }
+
+    fn string(&self, key String, $value String) void {
+        const encoded = json.Stringify(.Text(value)) else {
+            panic("a JSON string could not be encoded")
+        }
+        self.raw(key, encoded)
+    }
+
+    fn value(&self, key String, $value json.Value) Result<void, failure> {
+        const encoded = encode($value) else error {
+            return .Err(error)
+        }
+        self.raw(key, encoded)
+        .Ok
+    }
+
+    fn flag(&self, key String, value bool) void {
+        self.raw(key, "true" if value else "false")
+    }
+
+    fn finish(&self) Result<String, failure> {
+        append(&self.builder, "}")
+        const line = self.builder.Finish() else {
+            return .Err(fault(.InvalidSource, "record builder was closed"))
+        }
+        .Ok(line)
+    }
+}
+
+fn newRecord() record {
+    record { builder = text.NewBuilder() empty = true }
+}
+
+// Appends to a builder that stays open until its owner finishes it.
+fn append(&builder text.Builder, value String) void {
+    discard builder.Write(value)
+}
+
+fn encode($value json.Value) Result<String, failure> {
+    const encoded = json.Stringify($value) else error {
+        return match error.Kind {
+            DepthLimit: .Err(fault(.InvalidSource, "record nests too deeply"))
+            InvalidNumber: .Err(fault(.InvalidSource, "record carries an invalid number"))
+            Builder: .Err(fault(.InvalidSource, "record could not be serialized"))
+        }
+    }
+    .Ok(encoded)
+}

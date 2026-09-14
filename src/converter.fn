@@ -1,0 +1,322 @@
+package transcript.converter
+
+import std.collections
+import std.format
+import std.json
+import std.text
+
+enum userKind {
+    Prompt
+    Context
+    Summary
+    ToolResult
+}
+
+struct pendingBlock {
+    uuid String
+    timestamp String
+    content own json.Array
+    extras own json.Object
+}
+
+// Converts one Codex rollout into Claude Code transcript lines. Assistant
+// records wait in pending until Codex reports the token usage of their response,
+// so every record of one response carries the same message id and usage.
+struct converter {
+    sessionID String
+    transcript String
+    title String
+    lastPrompt String = ""
+    cwd String = ""
+    branch String = ""
+    model String = ""
+    parent String = ""
+    output own collections.Queue<String>
+    pending own collections.Queue<pendingBlock>
+    responseID String = ""
+    pendingID String = ""
+    pendingTool bool = false
+    usageInput u64 = 0
+    usageCached u64 = 0
+    usageOutput u64 = 0
+    callOpen bool = false
+    callID String = ""
+    callUse String = ""
+    callItems own json.Array
+    counts tally
+}
+
+fn newConverter(sessionID String, transcript String, title String) own converter {
+    own converter {
+        sessionID = text.Copy(sessionID)
+        transcript = text.Copy(transcript)
+        title = text.Copy(title)
+        output = collections.NewQueue<String>()
+        pending = collections.NewQueue<pendingBlock>()
+        callItems = json.NewArray()
+        counts = tally {}
+    }
+}
+
+methods converter {
+    fn Accept(&self, line String, number u64) Result<void, failure> {
+        const parsed = parseLine(line, number) else error {
+            return .Err(error)
+        }
+        var source = parsed
+        self.counts.lines += 1
+        const kind = takeText(&source, "type")
+        const timestamp = takeText(&source, "timestamp")
+        var body = takeObject(&source, "payload")
+        const key = format.U64(number)
+        if kind == "response_item" return self.item($body, timestamp, key)
+        if kind == "event_msg" return self.event($body, timestamp, key)
+        if kind == "compacted" return self.compacted($body, timestamp, key)
+        if kind == "token_usage_record" return self.usage($body)
+        if kind == "turn_context" return self.turnContext($body)
+        if kind == "session_meta" return self.sessionMeta($body, timestamp, key)
+        if kind == "world_state" {
+            self.counts.snapshots += 1
+            return .Ok
+        }
+        self.counts.unknown += 1
+        .Ok
+    }
+
+    // Ends the transcript with the records `claude --resume` reads from the last
+    // 64 KiB of a file. The injected context at the start of a Codex session keeps
+    // the first typed prompt out of the head the session list reads.
+    fn Finish(&self) Result<void, failure> {
+        self.flush() else error {
+            return .Err(error)
+        }
+        if !text.IsEmpty(self.title) {
+            var line = newRecord()
+            line.string("type", "ai-title")
+            line.string("aiTitle", text.Copy(self.title))
+            line.string("sessionId", text.Copy(self.sessionID))
+            self.trailing(&line) else error {
+                return .Err(error)
+            }
+        }
+        if text.IsEmpty(self.lastPrompt) return .Ok
+        var line = newRecord()
+        line.string("type", "last-prompt")
+        line.string("lastPrompt", text.Copy(self.lastPrompt))
+        line.string("leafUuid", text.Copy(self.parent))
+        line.string("sessionId", text.Copy(self.sessionID))
+        self.trailing(&line)
+    }
+
+    fn trailing(&self, &line record) Result<void, failure> {
+        const finished = line.finish() else error {
+            return .Err(error)
+        }
+        self.output.Enqueue($finished)
+        self.counts.metadata += 1
+        .Ok
+    }
+
+    fn Next(&self) Option<String> {
+        self.output.Dequeue()
+    }
+
+    fn uuidFor(&self, key String) String {
+        derivedUUID(self.sessionID + "/" + key)
+    }
+
+    fn provenance(&self, key String) own json.Object {
+        var extras = json.NewObject()
+        put(&extras, "line", .Text(text.Copy(key)))
+        extras
+    }
+
+    fn opening(&self, kind String) record {
+        var line = newRecord()
+        if text.IsEmpty(self.parent) {
+            line.raw("parentUuid", "null")
+        } else {
+            line.string("parentUuid", text.Copy(self.parent))
+        }
+        line.flag("isSidechain", false)
+        line.string("type", text.Copy(kind))
+        line
+    }
+
+    fn closing(
+        &self,
+        &line record,
+        uuid String,
+        timestamp String,
+        $extras own json.Object
+    ) Result<void, failure> {
+        line.string("uuid", text.Copy(uuid))
+        line.string("timestamp", text.Copy(timestamp))
+        line.string("sessionId", text.Copy(self.sessionID))
+        line.string("cwd", text.Copy(self.cwd))
+        if !text.IsEmpty(self.branch) {
+            line.string("gitBranch", text.Copy(self.branch))
+        }
+        line.string("userType", "external")
+        line.value("codex", .Object(extras)) else error {
+            return .Err(error)
+        }
+        const finished = line.finish() else error {
+            return .Err(error)
+        }
+        self.output.Enqueue($finished)
+        self.parent = text.Copy(uuid)
+        self.counts.records += 1
+        .Ok
+    }
+
+    fn emitUser(
+        &self,
+        $content own json.Array,
+        kind userKind,
+        toolUse String,
+        uuid String,
+        timestamp String,
+        $extras own json.Object
+    ) Result<void, failure> {
+        self.flush() else error {
+            return .Err(error)
+        }
+        var line = self.opening("user")
+        var message = json.NewObject()
+        put(&message, "role", .Text("user"))
+        put(&message, "content", .Array(content))
+        line.value("message", .Object(message)) else error {
+            return .Err(error)
+        }
+        match kind {
+            Prompt: {
+                self.counts.prompts += 1
+            }
+            Context: {
+                line.flag("isMeta", true)
+                self.counts.context += 1
+            }
+            Summary: {
+                line.flag("isCompactSummary", true)
+                line.flag("isVisibleInTranscriptOnly", true)
+                self.counts.summaries += 1
+            }
+            ToolResult: {
+                if !text.IsEmpty(toolUse) {
+                    line.string("sourceToolAssistantUUID", text.Copy(toolUse))
+                }
+                self.counts.toolResults += 1
+            }
+        }
+        self.closing(&line, uuid, timestamp, $extras)
+    }
+
+    // Writes a display-only system line; Claude Code never sends these to a model.
+    fn notice(
+        &self,
+        $content String,
+        level String,
+        timestamp String,
+        key String,
+        $extras own json.Object
+    ) Result<void, failure> {
+        self.flush() else error {
+            return .Err(error)
+        }
+        var line = self.opening("system")
+        line.string("subtype", "informational")
+        line.string("content", $content)
+        line.string("level", text.Copy(level))
+        line.flag("isMeta", false)
+        self.counts.notices += 1
+        self.closing(&line, self.uuidFor(key), timestamp, $extras)
+    }
+
+    fn queueBlock(
+        &self,
+        $content own json.Array,
+        tool bool,
+        codexID String,
+        uuid String,
+        timestamp String,
+        $extras own json.Object
+    ) void {
+        if self.pending.IsEmpty() {
+            self.pendingID = text.Copy(codexID)
+        }
+        if tool {
+            self.pendingTool = true
+        }
+        self.pending.Enqueue(pendingBlock {
+            uuid = text.Copy(uuid)
+            timestamp = text.Copy(timestamp)
+            content = content
+            extras = extras
+        })
+    }
+
+    fn messageID(&self) String {
+        if !text.IsEmpty(self.responseID) return text.Copy(self.responseID)
+        "msg_" + self.pendingID
+    }
+
+    fn usageObject(&self) own json.Object {
+        var fresh u64 = 0
+        if self.usageInput >= self.usageCached {
+            fresh = self.usageInput - self.usageCached
+        }
+        var usage = json.NewObject()
+        put(&usage, "input_tokens", .Number(format.U64(fresh)))
+        put(&usage, "cache_creation_input_tokens", .Number("0"))
+        put(&usage, "cache_read_input_tokens", .Number(format.U64(self.usageCached)))
+        put(&usage, "output_tokens", .Number(format.U64(self.usageOutput)))
+        usage
+    }
+
+    fn assistant(&self, $entry pendingBlock, messageID String, stop String) Result<void, failure> {
+        const pendingBlock { uuid timestamp content extras } = entry
+        var message = json.NewObject()
+        put(&message, "id", .Text(text.Copy(messageID)))
+        put(&message, "type", .Text("message"))
+        put(&message, "role", .Text("assistant"))
+        put(&message, "model", .Text(text.Copy(self.model)))
+        put(&message, "content", .Array(content))
+        put(&message, "stop_reason", .Text(text.Copy(stop)))
+        put(&message, "stop_sequence", .Null)
+        put(&message, "usage", .Object(self.usageObject()))
+        var line = self.opening("assistant")
+        line.value("message", .Object(message)) else error {
+            return .Err(error)
+        }
+        self.counts.assistant += 1
+        self.closing(&line, uuid, timestamp, $extras)
+    }
+
+    fn flush(&self) Result<void, failure> {
+        if self.pending.IsEmpty() return .Ok
+        const messageID = self.messageID()
+        const stop = "tool_use" if self.pendingTool else "end_turn"
+        var draining = true
+        while draining {
+            const next = self.pending.Dequeue()
+            match next {
+                None: {
+                    draining = false
+                }
+                Some(entry): {
+                    self.assistant($entry, messageID, stop) else error {
+                        return .Err(error)
+                    }
+                }
+            }
+        }
+        self.responseID = ""
+        self.pendingID = ""
+        self.pendingTool = false
+        self.usageInput = 0
+        self.usageCached = 0
+        self.usageOutput = 0
+        .Ok
+    }
+}

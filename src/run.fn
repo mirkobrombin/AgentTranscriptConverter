@@ -1,0 +1,241 @@
+package transcript.converter
+
+import std.bytes
+import std.format
+import std.fs
+import std.path
+import std.text
+
+// Codex writes whole tool outputs, images included, on one line.
+fn lineLimit() u64 {
+    268435456
+}
+
+// Records are written in chunks so memory stays bounded by the longest line
+// rather than by the length of the session.
+fn chunkLimit() u64 {
+    8388608
+}
+
+struct sink {
+    file own fs.File
+    batch own text.Builder
+    size u64
+}
+
+struct sinkOutcome {
+    target own sink
+    result Result<void, failure>
+}
+
+fn drain(&conv converter, &batch text.Builder) u64 {
+    var added u64 = 0
+    var draining = true
+    while draining {
+        const next = conv.Next()
+        match next {
+            None: {
+                draining = false
+            }
+            Some(line): {
+                added = added + text.ByteLen(line) + 1
+                append(&batch, line)
+                append(&batch, "\n")
+            }
+        }
+    }
+    added
+}
+
+task writeBatch($target own sink) sinkOutcome {
+    var current = target
+    const data = current.batch.Finish() else {
+        return sinkOutcome {
+            target = current
+            result = .Err(fault(.OutputUnavailable, "the output buffer closed early"))
+        }
+    }
+    current.batch = text.NewBuilder()
+    current.size = 0
+    const sink { file batch size } = current
+    const writing = spawn fs.WriteFileChunk($file, bytes.FromText(data))
+    const outcome = $writing.wait()
+    const fs.FileOutcome { File as returned Value as written } = outcome
+    const result Result<void, failure> = match written {
+        Ok: .Ok
+        Err(error): .Err(fault(.OutputUnavailable, "cannot write the transcript"))
+    }
+    sinkOutcome {
+        target = own sink { file = returned batch = batch size = size }
+        result = result
+    }
+}
+
+task closeSink($target own sink) Result<void, failure> {
+    var current = target
+    if current.size > 0 {
+        const writing = spawn writeBatch($current)
+        const outcome = $writing.wait()
+        const sinkOutcome { target as returned result } = outcome
+        current = returned
+        result else error {
+            return .Err(error)
+        }
+    }
+    const sink { file batch size } = current
+    discard batch
+    const syncing = spawn fs.SyncFile($file)
+    const synced = $syncing.wait()
+    const fs.FileOutcome { File as closing Value as flushed } = synced
+    flushed else {
+        return .Err(fault(.OutputUnavailable, "cannot flush the transcript"))
+    }
+    var handle = closing
+    const closed = handle.Close() else {
+        return .Err(fault(.OutputUnavailable, "cannot close the transcript"))
+    }
+    discard closed
+    .Ok
+}
+
+// A session Codex is still writing may end in a partly written line. Only the
+// final line may fail to parse; an earlier malformed line stops the conversion.
+fn acceptLine(
+    &conv converter,
+    line String,
+    number u64,
+    &lines fs.LineReader
+) Result<void, failure> {
+    const accepted = conv.Accept(line, number)
+    match accepted {
+        Ok: .Ok
+        Err(error): match error.kind {
+            MalformedRecord: {
+                const next = lines.NextLimited(lineLimit()) else {
+                    return .Err(error)
+                }
+                match next {
+                    None: {
+                        conv.counts.truncated += 1
+                        .Ok
+                    }
+                    Some(extra): {
+                        discard extra
+                        .Err(error)
+                    }
+                }
+            }
+            _: .Err(error)
+        }
+    }
+}
+
+task convertInto(
+    $source String,
+    $temporary String,
+    $sessionID String,
+    $transcript String,
+    $title String
+) Result<tally, failure> {
+    const opened = fs.OpenLines(source) else {
+        return .Err(fault(.SourceUnavailable, "cannot open " + source))
+    }
+    const opening = spawn fs.OpenFile($temporary, .Truncate)
+    const openedFile = $opening.wait()
+    const file = openedFile else {
+        return .Err(fault(.OutputUnavailable, "cannot open the output file"))
+    }
+    var lines = opened
+    var conv = newConverter(sessionID, transcript, title)
+    var target = own sink { file = file batch = text.NewBuilder() size = 0 }
+    var number u64 = 0
+    var reading = true
+    while reading {
+        const next = lines.NextLimited(lineLimit()) else {
+            return .Err(fault(.SourceUnavailable, "cannot read line " + format.U64(number + 1)))
+        }
+        match next {
+            None: {
+                reading = false
+            }
+            Some(line): {
+                number = number + 1
+                acceptLine(&conv, line, number, &lines) else error {
+                    return .Err(error)
+                }
+            }
+        }
+        target.size = target.size + drain(&conv, &target.batch)
+        if target.size >= chunkLimit() {
+            const writing = spawn writeBatch($target)
+            const outcome = $writing.wait()
+            const sinkOutcome { target as returned result } = outcome
+            target = returned
+            result else error {
+                return .Err(error)
+            }
+        }
+    }
+    conv.Finish() else error {
+        return .Err(error)
+    }
+    target.size = target.size + drain(&conv, &target.batch)
+    const closing = spawn closeSink($target)
+    const closed = $closing.wait()
+    closed else error {
+        return .Err(error)
+    }
+    .Ok(conv.counts)
+}
+
+task run($chosen own options) Result<String, failure> {
+    const codexHome = configuredDirectory(chosen.codexHome, "CODEX_HOME", ".codex") else error {
+        return .Err(error)
+    }
+    const variable = "CLAUDE_CONFIG_DIR"
+    const claudeHome = configuredDirectory(chosen.claudeHome, variable, ".claude") else error {
+        return .Err(error)
+    }
+    const source = resolveSource(chosen.source, codexHome) else error {
+        return .Err(error)
+    }
+    const meta = readSessionMeta(source) else error {
+        return .Err(error)
+    }
+    const sessionID = if text.IsEmpty(chosen.sessionID) {
+        derivedUUID("codex/" + meta.id)
+    } else {
+        text.Copy(chosen.sessionID)
+    }
+    const output = text.Copy(chosen.output)
+    const destination = resolveDestination(output, claudeHome, meta.cwd, sessionID) else error {
+        return .Err(error)
+    }
+    prepareDestination(destination) else error {
+        return .Err(error)
+    }
+    const temporary = fs.CreateTempFile(path.Parent(destination), ".transcript-converter-") else {
+        return .Err(fault(.OutputUnavailable, "cannot create a file beside " + destination))
+    }
+    const title = threadName(codexHome, meta.id)
+    const converting = spawn convertInto(
+        text.Copy(source),
+        text.Copy(temporary),
+        text.Copy(sessionID),
+        text.Copy(destination),
+        $title
+    )
+    const converted = $converting.wait()
+    const counts = match converted {
+        Ok(value): value
+        Err(error): {
+            discard fs.RemoveFile(temporary)
+            return .Err(error)
+        }
+    }
+    fs.Rename(temporary, destination) else {
+        discard fs.RemoveFile(temporary)
+        return .Err(fault(.OutputUnavailable, "cannot publish " + destination))
+    }
+    .Ok(render(counts, source, destination, sessionID))
+}

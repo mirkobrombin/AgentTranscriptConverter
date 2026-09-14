@@ -1,0 +1,252 @@
+package transcript.converter
+
+import std.env
+import std.fs
+import std.path
+import std.text
+
+struct sessionMeta {
+    id String
+    cwd String
+}
+
+fn homeDirectory() Result<String, failure> {
+    const found = env.Home() else {
+        return .Err(fault(.SourceUnavailable, "the home directory is not readable"))
+    }
+    match found {
+        None: .Err(fault(.SourceUnavailable, "the home directory is not set"))
+        Some(home): .Ok(home)
+    }
+}
+
+// Resolves a directory from its option, then its environment variable, then a
+// default beneath the home directory.
+fn configuredDirectory(
+    explicit String,
+    variable String,
+    fallback String
+) Result<String, failure> {
+    if !text.IsEmpty(explicit) return .Ok(text.Copy(explicit))
+    const found = env.Get(variable) else {
+        return .Err(fault(.InvalidArguments, variable + " is not valid UTF-8"))
+    }
+    match found {
+        None: {}
+        Some(value): {
+            if !text.IsEmpty(value) return .Ok(value)
+        }
+    }
+    const home = homeDirectory() else error {
+        return .Err(error)
+    }
+    .Ok(path.Join(home, fallback))
+}
+
+fn isRegularFile(candidate String) bool {
+    const exists = fs.Exists(candidate) else {
+        return false
+    }
+    if !exists return false
+    const directory = fs.IsDirectory(candidate) else {
+        return false
+    }
+    !directory
+}
+
+fn scanRollouts(root String, suffix String, &found String) Result<u64, failure> {
+    const present = fs.Exists(root) else {
+        return .Ok(0)
+    }
+    if !present return .Ok(0)
+    const opened = fs.OpenTree(root, 4000000, 4096) else {
+        return .Err(fault(.SourceUnavailable, "cannot list " + root))
+    }
+    var tree = opened
+    var matches u64 = 0
+    var scanning = true
+    while scanning {
+        const next = tree.Next() else {
+            return .Err(fault(.SourceUnavailable, "cannot list " + root))
+        }
+        match next {
+            None: {
+                scanning = false
+            }
+            Some(entry): {
+                if text.EndsWith(entry.Path, suffix) {
+                    found = path.Join(root, entry.Path)
+                    matches = matches + 1
+                }
+            }
+        }
+    }
+    .Ok(matches)
+}
+
+fn findRollout(codexHome String, id String) Result<String, failure> {
+    const suffix = "-" + id + ".jsonl"
+    var found = ""
+    const live = scanRollouts(path.Join(codexHome, "sessions"), suffix, &found) else error {
+        return .Err(error)
+    }
+    const archive = path.Join(codexHome, "archived_sessions")
+    const archived = scanRollouts(archive, suffix, &found) else error {
+        return .Err(error)
+    }
+    const matches = live + archived
+    if matches == 0 {
+        const message = "no Codex rollout for session " + id + " under " + codexHome
+        return .Err(fault(.SourceUnavailable, message))
+    }
+    if matches > 1 {
+        const message = "session " + id + " has several rollouts; pass one path"
+        return .Err(fault(.SourceUnavailable, message))
+    }
+    .Ok(found)
+}
+
+fn indexedName(line String, id String) Option<String> {
+    const parsed = parseLine(line, 0) else {
+        return .None
+    }
+    var entry = parsed
+    if takeText(&entry, "id") != id return .None
+    .Some(takeText(&entry, "thread_name"))
+}
+
+// Reads the thread name Codex shows for a session. Codex appends a line to its
+// session index on every rename, so the last matching line wins.
+fn threadName(codexHome String, id String) String {
+    const index = path.Join(codexHome, "session_index.jsonl")
+    if !isRegularFile(index) return ""
+    const opened = fs.OpenLines(index) else {
+        return ""
+    }
+    var lines = opened
+    var name = ""
+    var reading = true
+    while reading {
+        const next = lines.NextLimited(lineLimit()) else {
+            return name
+        }
+        match next {
+            None: {
+                reading = false
+            }
+            Some(line): {
+                match indexedName(line, id) {
+                    None: {}
+                    Some(found): {
+                        name = found
+                    }
+                }
+            }
+        }
+    }
+    name
+}
+
+fn resolveSource(source String, codexHome String) Result<String, failure> {
+    if isRegularFile(source) return .Ok(text.Copy(source))
+    const id = UUID.Parse(source) else {
+        const message = source + " is neither a rollout file nor a session id"
+        return .Err(fault(.SourceUnavailable, message))
+    }
+    findRollout(codexHome, id.String())
+}
+
+fn isAlphanumeric(byte u64) bool {
+    (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+}
+
+// Matches Claude Code's project folder naming, which replaces every UTF-16 code
+// unit outside ASCII letters and digits with "-". Claude Code shortens names over
+// 200 units with a hash this tool does not reproduce, so those need --output.
+fn projectFolder(cwd String) Result<String, failure> {
+    var builder = text.NewBuilder()
+    var units u64 = 0
+    const length = text.ByteLen(cwd)
+    var index u64 = 0
+    while index < length {
+        const byte = text.ByteAt(cwd, index) else {
+            return .Err(fault(.InvalidSource, "the session directory is not valid text"))
+        }
+        index = index + 1
+        if byte >= 128 && byte < 192 continue
+        if isAlphanumeric(byte) {
+            discard builder.WriteCodePoint(byte)
+            units = units + 1
+            continue
+        }
+        const surrogates = byte >= 240
+        append(&builder, "--" if surrogates else "-")
+        units = units + (2 if surrogates else 1)
+    }
+    const name = builder.Finish() else {
+        panic("folder name builder closed early")
+    }
+    if units > 200 {
+        const message = "the Claude project folder for " + cwd + " needs --output"
+        return .Err(fault(.OutputUnavailable, message))
+    }
+    .Ok(name)
+}
+
+fn resolveDestination(
+    output String,
+    claudeHome String,
+    cwd String,
+    sessionID String
+) Result<String, failure> {
+    if !text.IsEmpty(output) return .Ok(text.Copy(output))
+    if text.IsEmpty(cwd) {
+        const message = "the rollout records no working directory; pass --output"
+        return .Err(fault(.InvalidSource, message))
+    }
+    const folder = projectFolder(cwd) else error {
+        return .Err(error)
+    }
+    const projects = path.Join(claudeHome, "projects")
+    .Ok(path.Join(path.Join(projects, folder), sessionID + ".jsonl"))
+}
+
+fn prepareDestination(destination String) Result<void, failure> {
+    const exists = fs.Exists(destination) else {
+        return .Err(fault(.OutputUnavailable, "cannot inspect " + destination))
+    }
+    if exists {
+        const message = destination + " already exists and is never replaced"
+        return .Err(fault(.OutputUnavailable, message))
+    }
+    const parent = path.Parent(destination)
+    fs.CreateDirectory(parent) else {
+        return .Err(fault(.OutputUnavailable, "cannot create " + parent))
+    }
+    .Ok
+}
+
+fn readSessionMeta(source String) Result<sessionMeta, failure> {
+    const opened = fs.OpenLines(source) else {
+        return .Err(fault(.SourceUnavailable, "cannot open " + source))
+    }
+    var lines = opened
+    const first = lines.NextLimited(lineLimit()) else {
+        return .Err(fault(.SourceUnavailable, "cannot read " + source))
+    }
+    const line = match first {
+        None: ""
+        Some(value): value
+    }
+    const parsed = parseLine(line, 1) else error {
+        return .Err(error)
+    }
+    var head = parsed
+    if takeText(&head, "type") != "session_meta" {
+        return .Err(fault(.InvalidSource, source + " does not start with Codex session metadata"))
+    }
+    var payload = takeObject(&head, "payload")
+    const id = takeText(&payload, "id")
+    const cwd = takeText(&payload, "cwd")
+    .Ok(sessionMeta { id = id cwd = cwd })
+}

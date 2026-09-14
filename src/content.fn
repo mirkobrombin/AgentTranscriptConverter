@@ -1,0 +1,170 @@
+package transcript.converter
+
+import std.json
+import std.text
+
+fn textBlock($value String) json.Value {
+    var block = json.NewObject()
+    put(&block, "type", .Text("text"))
+    put(&block, "text", .Text(value))
+    .Object(block)
+}
+
+// Claude rejects empty and whitespace-only text blocks, which carry no content.
+fn isBlank(value String) bool {
+    const length = text.ByteLen(value)
+    var index u64 = 0
+    while index < length {
+        const byte = text.ByteAt(value, index) else {
+            return false
+        }
+        if byte != 32 && byte != 9 && byte != 10 && byte != 13 return false
+        index = index + 1
+    }
+    true
+}
+
+fn base64Offset(url String) u64 {
+    const found = text.Find(url, ";base64,")
+    match found {
+        None: 0
+        Some(offset): offset
+    }
+}
+
+// Codex stores images as data URLs; Claude wants the media type and base64
+// payload apart. Any other URL is passed through as a URL source.
+fn imageSource($url String) own json.Object {
+    var source = json.NewObject()
+    const offset = base64Offset(url)
+    if offset <= 5 || !text.StartsWith(url, "data:") {
+        put(&source, "type", .Text("url"))
+        put(&source, "url", .Text(url))
+        return source
+    }
+    const media = text.Slice(url, 5, offset) else {
+        panic("an ASCII data URL marker split a character")
+    }
+    const data = text.Slice(url, offset + 8, text.ByteLen(url)) else {
+        panic("an ASCII data URL marker split a character")
+    }
+    put(&source, "type", .Text("base64"))
+    put(&source, "media_type", .Text(media))
+    put(&source, "data", .Text(data))
+    source
+}
+
+fn imageBlock($url String) json.Value {
+    var block = json.NewObject()
+    put(&block, "type", .Text("image"))
+    put(&block, "source", .Object(imageSource($url)))
+    .Object(block)
+}
+
+fn wrappedBlock($value json.Value) Result<Option<json.Value>, failure> {
+    const encoded = encode($value) else error {
+        return .Err(error)
+    }
+    .Ok(.Some(textBlock($encoded)))
+}
+
+fn objectBlock($object own json.Object) Result<Option<json.Value>, failure> {
+    var part = object
+    const kind = takeText(&part, "type")
+    if kind == "input_text" || kind == "output_text" || kind == "text" {
+        const value = takeText(&part, "text")
+        if isBlank(value) return .Ok(.None)
+        return .Ok(.Some(textBlock($value)))
+    }
+    if kind == "input_image" {
+        return .Ok(.Some(imageBlock(takeText(&part, "image_url"))))
+    }
+    put(&part, "type", .Text(kind))
+    wrappedBlock(.Object(part))
+}
+
+// Converts one Codex content part. A part with no Claude block type becomes text
+// holding its original JSON, so no part is dropped silently.
+fn contentBlock($part json.Value) Result<Option<json.Value>, failure> {
+    match part {
+        Object(object): objectBlock($object)
+        Text(value): {
+            if isBlank(value) return .Ok(.None)
+            .Ok(.Some(textBlock($value)))
+        }
+        Array(array): wrappedBlock(.Array(array))
+        Number(spelling): .Ok(.Some(textBlock($spelling)))
+        Bool(state): .Ok(.Some(textBlock("true" if state else "false")))
+        Null: .Ok(.None)
+    }
+}
+
+fn convertParts($parts own json.Array) Result<own json.Array, failure> {
+    var source = parts
+    var blocks = json.NewArray()
+    while source.Len() > 0 {
+        const next = source.PopFront()
+        const part = match next {
+            None: json.Value.Null
+            Some(value): value
+        }
+        const converted = contentBlock($part) else error {
+            return .Err(error)
+        }
+        match converted {
+            None: {}
+            Some(block): blocks.Add($block)
+        }
+    }
+    .Ok(blocks)
+}
+
+fn toolResultContent($output json.Value) Result<json.Value, failure> {
+    match output {
+        Text(value): .Ok(.Text(value))
+        Array(parts): {
+            const blocks = convertParts($parts) else error {
+                return .Err(error)
+            }
+            if blocks.Len() == 0 return .Ok(.Text(""))
+            .Ok(.Array(blocks))
+        }
+        Object(object): {
+            const encoded = encode(.Object(object)) else error {
+                return .Err(error)
+            }
+            .Ok(.Text(encoded))
+        }
+        Number(spelling): .Ok(.Text(spelling))
+        Bool(state): .Ok(.Text("true" if state else "false"))
+        Null: .Ok(.Text(""))
+    }
+}
+
+fn customInput($input String) own json.Object {
+    var result = json.NewObject()
+    put(&result, "input", .Text(input))
+    result
+}
+
+// Function arguments arrive as a JSON string; Claude tool input is an object.
+fn functionInput($arguments String) own json.Object {
+    const parsed = json.Parse(arguments) else {
+        var raw = json.NewObject()
+        put(&raw, "arguments", .Text(arguments))
+        return raw
+    }
+    match parsed {
+        Object(object): object
+        _: {
+            var raw = json.NewObject()
+            put(&raw, "arguments", .Text(arguments))
+            raw
+        }
+    }
+}
+
+fn toolName(namespace String, name String) String {
+    if text.IsEmpty(namespace) return text.Copy(name)
+    namespace + "__" + name
+}

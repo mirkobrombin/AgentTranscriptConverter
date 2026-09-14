@@ -1,0 +1,271 @@
+package transcript.converter
+
+import std.format
+import std.json
+import std.text
+
+// Returns the script of a Codex command. Codex stores the command as an argv
+// whose last element is the text handed to the shell.
+fn commandText(&item json.Object) String {
+    var command = takeArray(&item, "command")
+    var kept = json.NewArray()
+    var last = ""
+    while command.Len() > 0 {
+        const next = command.PopFront()
+        const value = match next {
+            None: json.Value.Null
+            Some(found): found
+        }
+        match value {
+            Text(content): {
+                last = text.Copy(content)
+                kept.Add(.Text(content))
+            }
+            _: {}
+        }
+    }
+    if kept.Len() > 0 {
+        put(&item, "command", .Array(kept))
+    }
+    last
+}
+
+methods converter {
+    fn sessionMeta(
+        &self,
+        $payload own json.Object,
+        timestamp String,
+        key String
+    ) Result<void, failure> {
+        var meta = payload
+        const id = peekText(&meta, "id")
+        const cwd = peekText(&meta, "cwd")
+        if !text.IsEmpty(cwd) {
+            self.cwd = cwd
+        }
+        var git = takeObject(&meta, "git")
+        const branch = peekText(&git, "branch")
+        if !text.IsEmpty(branch) {
+            self.branch = branch
+        }
+        restoreObject(&meta, "git", $git)
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(meta))
+        self.notice("Converted from Codex session " + id + ".", "info", timestamp, key, $extras)
+    }
+
+    fn turnContext(&self, $payload own json.Object) Result<void, failure> {
+        var context = payload
+        const model = takeText(&context, "model")
+        if !text.IsEmpty(model) {
+            self.model = model
+        }
+        const cwd = takeText(&context, "cwd")
+        if !text.IsEmpty(cwd) {
+            self.cwd = cwd
+        }
+        self.counts.settings += 1
+        .Ok
+    }
+
+    fn usage(&self, $payload own json.Object) Result<void, failure> {
+        var record = payload
+        self.counts.usage += 1
+        if self.pending.IsEmpty() return .Ok
+        self.responseID = takeText(&record, "response_id")
+        var tokens = takeObject(&record, "usage")
+        self.usageInput = countOf(takeNumber(&tokens, "input_tokens"))
+        self.usageCached = countOf(takeNumber(&tokens, "cached_input_tokens"))
+        self.usageOutput = countOf(takeNumber(&tokens, "output_tokens"))
+        self.flush()
+    }
+
+    // A Codex compaction becomes a Claude compaction boundary followed by the
+    // history Codex kept. Claude Code resumes from the last boundary, so the
+    // resumed context matches what Codex carried after its own compaction.
+    fn compacted(
+        &self,
+        $payload own json.Object,
+        timestamp String,
+        key String
+    ) Result<void, failure> {
+        self.flush() else error {
+            return .Err(error)
+        }
+        var compaction = payload
+        var history = takeArray(&compaction, "replacement_history")
+        var latest = takeObject(&compaction, "latest_token_usage_record")
+        var tokens = takeObject(&latest, "usage")
+        const before = peekNumber(&tokens, "input_tokens")
+        restoreObject(&latest, "usage", $tokens)
+        restoreObject(&compaction, "latest_token_usage_record", $latest)
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(compaction))
+        self.boundary(before, timestamp, key, $extras) else error {
+            return .Err(error)
+        }
+        var index u64 = 0
+        while history.Len() > 0 {
+            const next = history.PopFront()
+            const entry = match next {
+                None: json.NewObject()
+                Some(value): objectOf($value)
+            }
+            self.item($entry, timestamp, key + ":" + format.U64(index)) else error {
+                return .Err(error)
+            }
+            index = index + 1
+        }
+        self.flush()
+    }
+
+    fn boundary(
+        &self,
+        before String,
+        timestamp String,
+        key String,
+        $extras own json.Object
+    ) Result<void, failure> {
+        var line = newRecord()
+        line.raw("parentUuid", "null")
+        if text.IsEmpty(self.parent) {
+            line.raw("logicalParentUuid", "null")
+        } else {
+            line.string("logicalParentUuid", text.Copy(self.parent))
+        }
+        line.flag("isSidechain", false)
+        line.string("type", "system")
+        line.string("subtype", "compact_boundary")
+        line.string("content", "Conversation compacted")
+        line.string("level", "info")
+        line.flag("isMeta", false)
+        var metadata = json.NewObject()
+        put(&metadata, "trigger", .Text("auto"))
+        const tokens = if text.IsEmpty(before) { "0" } else { text.Copy(before) }
+        put(&metadata, "preTokens", .Number(tokens))
+        line.value("compactMetadata", .Object(metadata)) else error {
+            return .Err(error)
+        }
+        self.counts.compactions += 1
+        self.closing(&line, self.uuidFor(key), timestamp, $extras)
+    }
+
+    fn event(
+
+        &self,
+
+        $payload own json.Object,
+
+        timestamp String,
+
+        key String
+
+    ) Result<void, failure> {
+        var event = payload
+        const kind = peekText(&event, "type")
+        if kind == "item_completed" return self.itemCompleted($event, timestamp, key)
+        if kind == "task_complete" return self.taskComplete($event, timestamp, key)
+        if kind == "turn_aborted" return self.turnAborted($event, timestamp, key)
+        if kind == "thread_goal_updated" return self.goalUpdated($event, timestamp, key)
+        self.counts.events += 1
+        .Ok
+    }
+
+    fn itemCompleted(
+        &self,
+        $payload own json.Object,
+        timestamp String,
+        key String
+    ) Result<void, failure> {
+        var event = payload
+        var item = takeObject(&event, "item")
+        if self.callOpen {
+            self.callItems.Add(.Object(item))
+            self.counts.attached += 1
+            return .Ok
+        }
+        if peekText(&item, "type") != "CommandExecution" {
+            self.counts.mirrored += 1
+            return .Ok
+        }
+        const status = peekText(&item, "status")
+        const exit = peekNumber(&item, "exit_code")
+        const command = commandText(&item)
+        const outcome = if text.IsEmpty(exit) { status } else { status + ", exit " + exit }
+        put(&event, "item", .Object(item))
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(event))
+        const content = "Codex background command (" + outcome + "): " + command
+        self.notice($content, "info", timestamp, key, $extras)
+    }
+
+    fn taskComplete(
+
+        &self,
+
+        $payload own json.Object,
+
+        timestamp String,
+
+        key String
+
+    ) Result<void, failure> {
+        var event = payload
+        const duration = peekNumber(&event, "duration_ms")
+        if text.IsEmpty(duration) {
+            self.counts.events += 1
+            return .Ok
+        }
+        self.flush() else error {
+            return .Err(error)
+        }
+        var line = self.opening("system")
+        line.string("subtype", "turn_duration")
+        line.raw("durationMs", duration)
+        line.flag("isMeta", false)
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(event))
+        self.counts.durations += 1
+        self.closing(&line, self.uuidFor(key), timestamp, $extras)
+    }
+
+    fn turnAborted(
+
+        &self,
+
+        $payload own json.Object,
+
+        timestamp String,
+
+        key String
+
+    ) Result<void, failure> {
+        var event = payload
+        const reason = peekText(&event, "reason")
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(event))
+        self.notice("Codex turn ended: " + reason + ".", "warning", timestamp, key, $extras)
+    }
+
+    fn goalUpdated(
+
+        &self,
+
+        $payload own json.Object,
+
+        timestamp String,
+
+        key String
+
+    ) Result<void, failure> {
+        var event = payload
+        var goal = takeObject(&event, "goal")
+        const status = peekText(&goal, "status")
+        const objective = peekText(&goal, "objective")
+        restoreObject(&event, "goal", $goal)
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(event))
+        const content = "Codex goal " + status + ": " + objective
+        self.notice($content, "info", timestamp, key, $extras)
+    }
+}

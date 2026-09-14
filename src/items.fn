@@ -1,0 +1,284 @@
+package transcript.converter
+
+import std.json
+import std.text
+
+// Decides whether a Codex user message was typed by the person. Codex tags each
+// content part with its origin, and injected context such as AGENTS.md or goal
+// prompts carries a non-user kind. Untagged messages count as typed.
+fn typedByUser(&item json.Object) bool {
+    var metadata = takeObject(&item, "internal_chat_message_metadata_passthrough")
+    var kinds = takeArray(&metadata, "content_item_kinds")
+    var kept = json.NewArray()
+    var typed = true
+    while kinds.Len() > 0 {
+        const next = kinds.PopFront()
+        const value = match next {
+            None: json.Value.Null
+            Some(found): found
+        }
+        match value {
+            Text(kind): {
+                if !text.StartsWith(kind, "user.") {
+                    typed = false
+                }
+                kept.Add(.Text(kind))
+            }
+            _: {
+                typed = false
+            }
+        }
+    }
+    if kept.Len() > 0 {
+        put(&metadata, "content_item_kinds", .Array(kept))
+    }
+    restoreObject(&item, "internal_chat_message_metadata_passthrough", $metadata)
+    typed
+}
+
+// Joins the text blocks of a prompt and leaves every block in place.
+fn promptText(&blocks json.Array) String {
+    var kept = json.NewArray()
+    var joined = ""
+    while blocks.Len() > 0 {
+        const next = blocks.PopFront()
+        var block = match next {
+            None: json.NewObject()
+            Some(value): objectOf($value)
+        }
+        if peekText(&block, "type") == "text" {
+            const piece = peekText(&block, "text")
+            joined = if text.IsEmpty(joined) { piece } else { joined + "\n" + piece }
+        }
+        kept.Add(.Object(block))
+    }
+    while kept.Len() > 0 {
+        const back = kept.PopFront()
+        match back {
+            None: {}
+            Some(value): blocks.Add($value)
+        }
+    }
+    joined
+}
+
+fn summaryText($summary own json.Array) String {
+    var parts = summary
+    var joined = ""
+    while parts.Len() > 0 {
+        const next = parts.PopFront()
+        var entry = match next {
+            None: json.NewObject()
+            Some(value): objectOf($value)
+        }
+        const piece = takeText(&entry, "text")
+        if text.IsEmpty(piece) continue
+        joined = if text.IsEmpty(joined) { piece } else { joined + "\n\n" + piece }
+    }
+    joined
+}
+
+fn compactionNotice(transcript String) String {
+    "This session continues a Codex conversation that ran out of context. Codex " +
+        "replaced the earlier turns with a summary encrypted by its provider, which " +
+        "cannot be read outside Codex. The messages Codex kept across that compaction " +
+        "precede this note. The complete earlier conversation is preserved verbatim, " +
+        "before the compaction boundary, in " + transcript + "."
+}
+
+methods converter {
+    fn item(
+        &self,
+        $payload own json.Object,
+        timestamp String,
+        key String
+    ) Result<void, failure> {
+        var item = payload
+        const kind = peekText(&item, "type")
+        if kind == "message" return self.message($item, timestamp, key)
+        if kind == "reasoning" return self.reasoning($item, timestamp, key)
+        if kind == "custom_tool_call" || kind == "function_call" {
+            return self.toolCall($item, kind, timestamp, key)
+        }
+        if kind == "custom_tool_call_output" || kind == "function_call_output" {
+            return self.toolOutput($item, timestamp, key)
+        }
+        if kind == "compaction" return self.compaction($item, timestamp, key)
+        self.unknownItem($item, kind, timestamp, key)
+    }
+
+    fn message(
+
+        &self,
+
+        $payload own json.Object,
+
+        timestamp String,
+
+        key String
+
+    ) Result<void, failure> {
+        var item = payload
+        const role = peekText(&item, "role")
+        const id = peekText(&item, "id")
+        const typed = typedByUser(&item)
+        const parts = takeArray(&item, "content")
+        const converted = convertParts($parts) else error {
+            return .Err(error)
+        }
+        var blocks = converted
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(item))
+        if blocks.Len() == 0 {
+            self.counts.mirrored += 1
+            return .Ok
+        }
+        const uuid = self.uuidFor(key)
+        if role == "assistant" {
+            self.queueBlock($blocks, false, id, uuid, timestamp, $extras)
+            return .Ok
+        }
+        const prompt = role == "user" && typed
+        if prompt {
+            self.lastPrompt = promptText(&blocks)
+        }
+        const kind = userKind.Prompt if prompt else userKind.Context
+        self.emitUser($blocks, kind, "", uuid, timestamp, $extras)
+    }
+
+    // Codex keeps its own reasoning encrypted. Only the readable summary, when
+    // Codex produced one, can become a Claude thinking block.
+    fn reasoning(
+        &self,
+        $payload own json.Object,
+        timestamp String,
+        key String
+    ) Result<void, failure> {
+        var item = payload
+        const summary = takeArray(&item, "summary")
+        const thought = summaryText($summary)
+        if text.IsEmpty(thought) {
+            self.counts.encryptedReasoning += 1
+            return .Ok
+        }
+        const id = peekText(&item, "id")
+        var block = json.NewObject()
+        put(&block, "type", .Text("thinking"))
+        put(&block, "thinking", .Text(thought))
+        put(&block, "signature", .Text(""))
+        var content = json.NewArray()
+        content.Add(.Object(block))
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(item))
+        self.counts.thinking += 1
+        self.queueBlock($content, false, id, self.uuidFor(key), timestamp, $extras)
+        .Ok
+    }
+
+    fn toolCall(
+        &self,
+        $payload own json.Object,
+        kind String,
+        timestamp String,
+        key String
+    ) Result<void, failure> {
+        var item = payload
+        const callID = peekText(&item, "call_id")
+        const name = peekText(&item, "name")
+        const namespace = peekText(&item, "namespace")
+        const id = peekText(&item, "id")
+        const input = if kind == "custom_tool_call" {
+            customInput(takeText(&item, "input"))
+        } else {
+            functionInput(takeText(&item, "arguments"))
+        }
+        var block = json.NewObject()
+        put(&block, "type", .Text("tool_use"))
+        put(&block, "id", .Text(text.Copy(callID)))
+        put(&block, "name", .Text(toolName(namespace, name)))
+        put(&block, "input", .Object(input))
+        var content = json.NewArray()
+        content.Add(.Object(block))
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(item))
+        const uuid = self.uuidFor(key)
+        self.queueBlock($content, true, id, uuid, timestamp, $extras)
+        self.callOpen = true
+        self.callID = callID
+        self.callUse = uuid
+        self.callItems = json.NewArray()
+        self.counts.toolCalls += 1
+        .Ok
+    }
+
+    // Codex runs one tool call at a time, so every interface item Codex records
+    // between a call and its output belongs to that call and travels with the
+    // result.
+    fn toolOutput(
+        &self,
+        $payload own json.Object,
+        timestamp String,
+        key String
+    ) Result<void, failure> {
+        var item = payload
+        const callID = peekText(&item, "call_id")
+        const output = item.Take("output")
+        const value = match output {
+            None: json.Value.Text("")
+            Some(found): found
+        }
+        const result = toolResultContent($value) else error {
+            return .Err(error)
+        }
+        var block = json.NewObject()
+        put(&block, "type", .Text("tool_result"))
+        put(&block, "tool_use_id", .Text(text.Copy(callID)))
+        put(&block, "content", $result)
+        var content = json.NewArray()
+        content.Add(.Object(block))
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(item))
+        const owned = self.callOpen && self.callID == callID
+        const toolUse = if owned { text.Copy(self.callUse) } else { "" }
+        if owned {
+            const items = replace self.callItems with json.NewArray()
+            if items.Len() > 0 {
+                put(&extras, "items", .Array(items))
+            }
+        }
+        self.callOpen = false
+        self.emitUser($content, .ToolResult, toolUse, self.uuidFor(key), timestamp, $extras)
+    }
+
+    fn compaction(
+
+        &self,
+
+        $payload own json.Object,
+
+        timestamp String,
+
+        key String
+
+    ) Result<void, failure> {
+        var content = json.NewArray()
+        content.Add(textBlock(compactionNotice(self.transcript)))
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(payload))
+        self.emitUser($content, .Summary, "", self.uuidFor(key), timestamp, $extras)
+    }
+
+    fn unknownItem(
+        &self,
+        $payload own json.Object,
+        kind String,
+        timestamp String,
+        key String
+    ) Result<void, failure> {
+        var extras = self.provenance(key)
+        put(&extras, "payload", .Object(payload))
+        self.counts.unknown += 1
+        const content = "Codex " + kind + " item kept without a Claude equivalent."
+        self.notice($content, "info", timestamp, key, $extras)
+    }
+}

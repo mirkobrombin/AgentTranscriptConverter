@@ -1,0 +1,32 @@
+package transcript.converter
+
+import std.io
+
+fn usage() String {
+    "usage:\n" +
+        "  transcript-converter <codex-rollout.jsonl | codex-session-id> [--output path]\n" +
+        "      [--session-id uuid] [--codex-home path] [--claude-home path]\n"
+}
+
+fn printFailure(value failure) void {
+    discard io.WriteStderrText("transcript-converter: " + value.message + "\n")
+}
+
+fn main(args [String]) i32 {
+    const parsed = parseOptions(args) else error {
+        printFailure(error)
+        discard io.WriteStderrText(usage())
+        return 2
+    }
+    if parsed.help {
+        discard io.WriteStdoutText(usage())
+        return 0
+    }
+    const pending = spawn run($parsed)
+    const report = $pending.wait() else error {
+        printFailure(error)
+        return 1
+    }
+    discard io.WriteStdoutText(report)
+    0
+}
