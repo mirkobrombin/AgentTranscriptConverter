@@ -59,18 +59,17 @@ jobs:
         run: |
           mkdir -p build "$RUNNER_TEMP/out"
           ../toolchain/build/foundationc build . -o build/transcript-converter
-          build/transcript-converter examples/codex-rollout.jsonl \
-            --output "$RUNNER_TEMP/out/session.jsonl"
+          convert() {
+            build/transcript-converter examples/codex-rollout.jsonl \
+              --output "$RUNNER_TEMP/out/session.jsonl" --claude-home "$RUNNER_TEMP/claude"
+          }
+          convert
           test "$(wc -l < "$RUNNER_TEMP/out/session.jsonl")" -eq 11
           grep '"subtype":"compact_boundary"' "$RUNNER_TEMP/out/session.jsonl" \
             | head -c 256 | grep -q '"compact_boundary"'
           cp "$RUNNER_TEMP/out/session.jsonl" "$RUNNER_TEMP/first.jsonl"
           rm "$RUNNER_TEMP/out/session.jsonl"
-          build/transcript-converter examples/codex-rollout.jsonl \
-            --output "$RUNNER_TEMP/out/session.jsonl"
+          convert
           cmp "$RUNNER_TEMP/first.jsonl" "$RUNNER_TEMP/out/session.jsonl"
-          if build/transcript-converter examples/codex-rollout.jsonl \
-            --output "$RUNNER_TEMP/out/session.jsonl"; then
-            echo "an existing transcript was replaced" >&2
-            exit 1
-          fi
+          convert | grep -q "unchanged"
+          cmp "$RUNNER_TEMP/first.jsonl" "$RUNNER_TEMP/out/session.jsonl"
