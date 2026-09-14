@@ -1,0 +1,262 @@
+package transcript.converter
+
+import std.fs
+import std.path
+import std.text
+
+struct transcriptTail {
+    owned bool
+    leaf String
+    timestamp String
+    lastPrompt String
+    goalCondition String
+    goalMet bool
+}
+
+// Keeps the last line of each kind a transcript update needs, one line at a time.
+struct tailReader {
+    marker String
+    first bool = true
+    owned bool = false
+    record String = ""
+    prompt String = ""
+    goal String = ""
+
+    fn observe(&self, $line String) void {
+        if self.first {
+            self.owned = text.Contains(line, self.marker)
+            self.first = false
+        }
+        if text.StartsWith(line, "{\"type\":\"last-prompt\"") {
+            self.prompt = line
+            return
+        }
+        if !text.StartsWith(line, "{\"parentUuid\":") return
+        if text.Contains(line, "\"type\":\"goal_status\"") {
+            self.goal = text.Copy(line)
+        }
+        self.record = line
+    }
+}
+
+struct rolloutScan {
+    memories own memoryTracker
+    objective String
+    status String
+}
+
+fn readTranscriptTail(destination String, codexID String) Result<transcriptTail, failure> {
+    const opened = fs.OpenLines(destination) else {
+        return .Err(fault(.OutputUnavailable, "cannot open " + destination))
+    }
+    var lines = opened
+    var reader = tailReader { marker = "Converted from Codex session " + codexID }
+    var reading = true
+    while reading {
+        const next = lines.NextLimited(lineLimit()) else {
+            return .Err(fault(.OutputUnavailable, "cannot read " + destination))
+        }
+        match next {
+            None: {
+                reading = false
+            }
+            Some(line): reader.observe($line)
+        }
+    }
+    var tail = transcriptTail {
+        owned = reader.owned
+        leaf = ""
+        timestamp = ""
+        lastPrompt = ""
+        goalCondition = ""
+        goalMet = true
+    }
+    if !text.IsEmpty(reader.record) {
+        const parsedRecord = parseLine(reader.record, 0) else error {
+            return .Err(error)
+        }
+        var record = parsedRecord
+        tail.leaf = takeText(&record, "uuid")
+        tail.timestamp = takeText(&record, "timestamp")
+    }
+    if !text.IsEmpty(reader.prompt) {
+        const parsedPrompt = parseLine(reader.prompt, 0) else error {
+            return .Err(error)
+        }
+        var prompt = parsedPrompt
+        tail.lastPrompt = takeText(&prompt, "lastPrompt")
+    }
+    if !text.IsEmpty(reader.goal) {
+        const parsedGoal = parseLine(reader.goal, 0) else error {
+            return .Err(error)
+        }
+        var goal = parsedGoal
+        var attachment = takeObject(&goal, "attachment")
+        tail.goalCondition = takeText(&attachment, "condition")
+        tail.goalMet = takeBool(&attachment, "met")
+    }
+    .Ok(tail)
+}
+
+fn observeRollout(&scan rolloutScan, line String) void {
+    scan.memories.Observe(line)
+    if !text.Contains(line, "\"thread_goal_updated\"") return
+    const parsed = parseLine(line, 0) else {
+        return
+    }
+    var record = parsed
+    var payload = takeObject(&record, "payload")
+    var goal = takeObject(&payload, "goal")
+    const objective = takeText(&goal, "objective")
+    if text.IsEmpty(objective) return
+    scan.objective = objective
+    scan.status = takeText(&goal, "status")
+}
+
+// Reads a rollout without converting it, for a transcript that already exists:
+// the memory files the session used and its last goal event.
+fn scanRollout(source String, $tracker own memoryTracker) Result<rolloutScan, failure> {
+    const opened = fs.OpenLines(source) else {
+        return .Err(fault(.SourceUnavailable, "cannot open " + source))
+    }
+    var lines = opened
+    var scan = rolloutScan { memories = tracker objective = "" status = "" }
+    var reading = true
+    while reading {
+        const next = lines.NextLimited(lineLimit()) else {
+            return .Err(fault(.SourceUnavailable, "cannot read " + source))
+        }
+        match next {
+            None: {
+                reading = false
+            }
+            Some(line): observeRollout(&scan, line)
+        }
+    }
+    .Ok(scan)
+}
+
+fn processAlive(pid String) bool {
+    const proc = fs.IsDirectory("/proc") else {
+        return true
+    }
+    if !proc return true
+    const alive = fs.Exists(path.Join("/proc", pid)) else {
+        return true
+    }
+    alive
+}
+
+fn registryHolds(registry String, name String, sessionID String) Option<String> {
+    if !text.EndsWith(name, ".json") return .None
+    const content = fs.ReadTextSync(path.Join(registry, name), 1048576) else {
+        return .None
+    }
+    if !text.Contains(content, "\"sessionId\":\"" + sessionID + "\"") return .None
+    const pid = text.Slice(name, 0, text.ByteLen(name) - 5) else {
+        return .None
+    }
+    if !processAlive(pid) return .None
+    .Some(pid)
+}
+
+// Claude Code registers each running session in sessions/<pid>.json. Without
+// /proc the liveness of a registered process is unknown and it counts as live.
+fn openInClaude(claudeHome String, sessionID String) Option<String> {
+    const registry = path.Join(claudeHome, "sessions")
+    const present = fs.IsDirectory(registry) else {
+        return .None
+    }
+    if !present return .None
+    const opened = fs.OpenDir(registry) else {
+        return .None
+    }
+    var entries = opened
+    var holder Option<String> = .None
+    var reading = true
+    while reading {
+        const next = entries.Next() else {
+            return holder
+        }
+        match next {
+            None: {
+                reading = false
+            }
+            Some(name): {
+                const held = registryHolds(registry, name, sessionID)
+                match held {
+                    None: {}
+                    Some(pid): {
+                        holder = .Some(pid)
+                        reading = false
+                    }
+                }
+            }
+        }
+    }
+    holder
+}
+
+// A transcript that already exists is never rewritten, because Claude Code may
+// have continued the session in it. A goal record that differs from its last one
+// is appended after its last record, so Claude Code re-arms the goal on resume.
+// The session must not be open in Claude Code meanwhile: records it writes later
+// would continue from its own last message and leave the goal record behind.
+task updateExisting(
+    $destination String,
+    $sessionID String,
+    $codexID String,
+    $cwd String,
+    $claudeHome String,
+    $goal Option<codexGoal>
+) Result<String, failure> {
+    const tail = readTranscriptTail(destination, codexID) else error {
+        return .Err(error)
+    }
+    if !tail.owned || text.IsEmpty(tail.leaf) {
+        const message = destination + " exists and is not a conversion of " + codexID
+        return .Err(fault(.OutputUnavailable, message))
+    }
+    const chosen = match goal {
+        None: {
+            return .Ok("left " + destination + " unchanged: the session has no goal\n")
+        }
+        Some(found): found
+    }
+    const codexGoal { objective status } = chosen
+    const armed = goalArmed(status)
+    if tail.goalCondition == objective && tail.goalMet == !armed {
+        return .Ok("left " + destination + " unchanged: its goal record is current\n")
+    }
+    const holder = openInClaude(claudeHome, sessionID)
+    match holder {
+        None: {}
+        Some(pid): {
+            const reason = "the session is open in Claude Code, process " + pid
+            return .Ok("goal record not appended: " + reason + "; close it and run again\n")
+        }
+    }
+    var conv = newConverter(sessionID, destination, "")
+    conv.cwd = text.Copy(cwd)
+    conv.parent = text.Copy(tail.leaf)
+    conv.lastTimestamp = text.Copy(tail.timestamp)
+    conv.lastPrompt = text.Copy(tail.lastPrompt)
+    conv.goalKey = "goal:" + tail.leaf
+    conv.storedObjective = objective
+    conv.storedStatus = status
+    conv.Finish() else error {
+        return .Err(error)
+    }
+    var batch = text.NewBuilder()
+    discard drain(&conv, &batch)
+    const data = batch.Finish() else {
+        return .Err(fault(.OutputUnavailable, "the output buffer closed early"))
+    }
+    const appending = spawn appendText(text.Copy(destination), $data)
+    const appended = $appending.wait()
+    appended else error {
+        return .Err(error)
+    }
+    const state = "armed" if armed else "not armed"
+    .Ok("appended a goal record, " + state + " on resume, to " + destination + "\n")
+}

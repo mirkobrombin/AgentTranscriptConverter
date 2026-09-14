@@ -1,0 +1,267 @@
+package transcript.converter
+
+import std.collections
+import std.fs
+import std.json
+import std.path
+import std.text
+
+// Finds the Codex memory files a session opened or wrote. Codex keeps its memory
+// as Markdown under memories/ and names some of it in every set of instructions,
+// and a tool result can print a path the session never touched, such as a search
+// listing. Only a file named by one of the session's own tool calls counts.
+struct memoryTracker {
+    candidates own collections.Queue<String>
+    used own collections.Queue<String>
+    seen String = "\n"
+
+    fn Observe(&self, line String) void {
+        if !text.Contains(line, "memories/") return
+        if !text.Contains(line, "\"type\":\"response_item\"") return
+        const call = text.Contains(line, "\"type\":\"custom_tool_call\"") ||
+            text.Contains(line, "\"type\":\"function_call\"")
+        if !call return
+        var remaining = self.candidates.Len()
+        while remaining > 0 {
+            remaining = remaining - 1
+            const next = self.candidates.Dequeue()
+            match next {
+                None: {}
+                Some(relative): {
+                    self.mark(line, relative)
+                    self.candidates.Enqueue($relative)
+                }
+            }
+        }
+    }
+
+    fn mark(&self, line String, relative String) void {
+        if !text.Contains(line, "memories/" + relative) return
+        if text.Contains(self.seen, "\n" + relative + "\n") return
+        self.seen = self.seen + relative + "\n"
+        self.used.Enqueue(text.Copy(relative))
+    }
+}
+
+struct memoryResult {
+    imported u64 = 0
+    unchanged u64 = 0
+    kept u64 = 0
+    unreadable u64 = 0
+}
+
+fn newMemoryTracker() own memoryTracker {
+    own memoryTracker {
+        candidates = collections.NewQueue<String>()
+        used = collections.NewQueue<String>()
+    }
+}
+
+fn listMemories(codexHome String) own memoryTracker {
+    var tracker = newMemoryTracker()
+    const root = path.Join(codexHome, "memories")
+    const present = fs.IsDirectory(root) else {
+        return tracker
+    }
+    if !present return tracker
+    const opened = fs.OpenTree(root, 100000, 4096) else {
+        return tracker
+    }
+    var tree = opened
+    var scanning = true
+    while scanning {
+        const next = tree.Next() else {
+            return tracker
+        }
+        match next {
+            None: {
+                scanning = false
+            }
+            Some(entry): {
+                if text.EndsWith(entry.Path, ".md") {
+                    tracker.candidates.Enqueue(text.Copy(entry.Path))
+                }
+            }
+        }
+    }
+    tracker
+}
+
+// Names an imported memory after its Codex path: ASCII letters and digits in
+// lower case, every other run of characters as one "-".
+fn memorySlug(relative String) String {
+    var builder = text.NewBuilder()
+    var gap = false
+    var written = false
+    var length = text.ByteLen(relative)
+    if text.EndsWith(relative, ".md") {
+        length = length - 3
+    }
+    var index u64 = 0
+    while index < length {
+        const byte = text.ByteAt(relative, index) else {
+            panic("a memory path offset left its range")
+        }
+        index = index + 1
+        if !isAlphanumeric(byte) {
+            gap = true
+            continue
+        }
+        if gap && written {
+            append(&builder, "-")
+        }
+        const lower = byte + 32 if byte >= 65 && byte <= 90 else byte
+        discard builder.WriteCodePoint(lower)
+        gap = false
+        written = true
+    }
+    const slug = builder.Finish() else {
+        panic("memory name builder closed early")
+    }
+    "codex-" + slug
+}
+
+fn memoryTitle(content String, fallback String) String {
+    var start u64 = 0
+    if !text.StartsWith(content, "# ") {
+        const found = text.Find(content, "\n# ")
+        match found {
+            None: {
+                return text.Copy(fallback)
+            }
+            Some(offset): {
+                start = offset + 1
+            }
+        }
+    }
+    const rest = text.Slice(content, start + 2, text.ByteLen(content)) else {
+        return text.Copy(fallback)
+    }
+    const end = text.Find(rest, "\n")
+    match end {
+        None: rest
+        Some(offset): {
+            const title = text.Slice(rest, 0, offset) else {
+                return text.Copy(fallback)
+            }
+            title
+        }
+    }
+}
+
+fn memoryDocument(
+    name String,
+    title String,
+    source String,
+    codexID String,
+    content String
+) String {
+    const summary = title + " (Codex memory used by Codex session " + codexID + ")"
+    const description = json.Stringify(.Text(summary)) else {
+        panic("a JSON string could not be encoded")
+    }
+    "---\n" +
+        "name: " + name + "\n" +
+        "description: " + description + "\n" +
+        "metadata:\n" +
+        "  type: reference\n" +
+        "---\n\n" +
+        "Imported from the Codex memory `" + source + "`.\n\n" +
+        content
+}
+
+fn memoryLimit() u64 {
+    16777216
+}
+
+fn readOptional(target String) Result<String, failure> {
+    const exists = fs.Exists(target) else {
+        return .Err(fault(.OutputUnavailable, "cannot inspect " + target))
+    }
+    if !exists return .Ok("")
+    const content = fs.ReadTextSync(target, memoryLimit()) else {
+        return .Err(fault(.OutputUnavailable, "cannot read " + target))
+    }
+    .Ok(content)
+}
+
+// Copies each used Codex memory into the Claude Code project memory and lists
+// it in MEMORY.md. A memory file that already exists is never replaced.
+fn migrateMemories(
+    &tracker memoryTracker,
+    codexHome String,
+    directory String,
+    codexID String
+) Result<memoryResult, failure> {
+    var result = memoryResult {}
+    if tracker.used.IsEmpty() return .Ok(result)
+    fs.CreateDirectory(directory) else {
+        return .Err(fault(.OutputUnavailable, "cannot create " + directory))
+    }
+    const indexPath = path.Join(directory, "MEMORY.md")
+    const existing = readOptional(indexPath) else error {
+        return .Err(error)
+    }
+    var additions = ""
+    const root = path.Join(codexHome, "memories")
+    while !tracker.used.IsEmpty() {
+        const next = tracker.used.Dequeue()
+        const relative = match next {
+            None: ""
+            Some(value): value
+        }
+        const line = migrateMemory(&result, root, relative, directory, codexID) else error {
+            return .Err(error)
+        }
+        if !text.IsEmpty(line) && !text.Contains(existing, line) {
+            additions = additions + line
+        }
+    }
+    if text.IsEmpty(additions) return .Ok(result)
+    const separator = if text.IsEmpty(existing) || text.EndsWith(existing, "\n") {
+        ""
+    } else {
+        "\n"
+    }
+    fs.WriteTextAtomic(indexPath, existing + separator + additions, memoryLimit()) else {
+        return .Err(fault(.OutputUnavailable, "cannot update " + indexPath))
+    }
+    .Ok(result)
+}
+
+// Writes one memory and returns its MEMORY.md line, or "" when it was not
+// written.
+fn migrateMemory(
+    &result memoryResult,
+    root String,
+    relative String,
+    directory String,
+    codexID String
+) Result<String, failure> {
+    const source = path.Join(root, relative)
+    const content = fs.ReadTextSync(source, memoryLimit()) else {
+        result.unreadable += 1
+        return .Ok("")
+    }
+    const name = memorySlug(relative)
+    const title = memoryTitle(content, relative)
+    const document = memoryDocument(name, title, source, codexID, content)
+    const target = path.Join(directory, name + ".md")
+    const present = readOptional(target) else error {
+        return .Err(error)
+    }
+    const entry = "- [" + title + "](" + name + ".md): Codex memory " + relative + "\n"
+    if present == document {
+        result.unchanged += 1
+        return .Ok(entry)
+    }
+    if !text.IsEmpty(present) {
+        result.kept += 1
+        return .Ok("")
+    }
+    fs.WriteTextAtomic(target, document, memoryLimit()) else {
+        return .Err(fault(.OutputUnavailable, "cannot write " + target))
+    }
+    result.imported += 1
+    .Ok(entry)
+}

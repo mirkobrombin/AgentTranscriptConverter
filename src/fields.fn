@@ -56,6 +56,17 @@ fn takeNumber(&object json.Object, key String) String {
     }
 }
 
+fn takeBool(&object json.Object, key String) bool {
+    const found = object.Take(key)
+    match found {
+        None: false
+        Some(value): match value {
+            Bool(state): state
+            _: false
+        }
+    }
+}
+
 fn peekNumber(&object json.Object, key String) String {
     const found = takeNumber(&object, key)
     if !text.IsEmpty(found) {

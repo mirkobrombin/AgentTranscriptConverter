@@ -43,7 +43,8 @@ same destination produces the same bytes.
 | `item_completed` for a command outside a tool call | Transcript notice |
 | `compacted` | `compact_boundary`, the history Codex kept, and a compaction note |
 | `task_complete` | `turn_duration` |
-| `turn_aborted`, `thread_goal_updated` | Transcript notice |
+| `thread_goal_updated` | `goal_status` attachment |
+| `turn_aborted` | Transcript notice |
 
 Codex writes a second copy of each message, reasoning item, and user prompt as an interface event.
 Those copies are counted and not converted again. `world_state` snapshots are the structured form
@@ -64,12 +65,53 @@ the boundary.
 Codex encrypts its compaction summaries. Each summary is replaced by a compaction note that tells
 the model where the transcript with the complete earlier conversation is stored.
 
+## Goal
+
+Codex keeps one goal per thread and records every change of it in the rollout. Claude Code keeps
+a goal as a session Stop hook and records it as a `goal_status` attachment. On resume it re-arms
+the goal named by the last `goal_status` of the loaded conversation, unless that record is met or
+failed.
+
+| Codex goal status | Claude Code record |
+|---|---|
+| `active`, `usage_limited`, `budget_limited` | Not met, armed on resume |
+| `complete` | Met |
+| `paused`, `blocked` | Cleared, as `/goal clear` records it |
+
+Codex stops a goal when its own usage or budget runs out, which says nothing about the goal
+itself, so those goals stay armed. The goal state in Codex's `goals_1.sqlite` can be newer than
+the last goal event of the rollout; it is read through the `sqlite3` program when that program is
+installed. The final goal state is written after the last conversation record, past the last
+compaction boundary, where Claude Code looks for it.
+
+## Memories
+
+Codex keeps its memory as Markdown files under `memories` in the Codex directory. Claude Code
+keeps memory per project, in `projects/<folder>/memory`, as files with a frontmatter and one line
+each in `MEMORY.md`.
+
+A Codex memory file is imported when one of the session's own tool calls names it, which covers
+the files it read and the ones it wrote. Files mentioned only by the instructions Codex injects,
+or only printed by a tool result such as a search listing, are not imported. Each imported file becomes `codex-<name>.md` with a `reference`
+frontmatter and the original text unchanged, and gains a line in `MEMORY.md`. A memory file that
+already exists with other content is never replaced. `--no-memories` skips this step.
+
+## Converted sessions
+
+A transcript that already exists is never rewritten, because Claude Code may have continued the
+session in it. Running the converter again appends a goal record when the goal differs from the
+transcript's last one, chained to its last record, and imports memories that are missing. The
+session must not be open in Claude Code while this runs: records Claude Code writes afterwards
+continue from its own last message and would leave the goal record outside the resumed
+conversation.
+
 ## Session list
 
 `claude --resume` reads only the first and last 64 KiB of each transcript. The injected context at
 the start of a Codex session usually fills the first part, so the transcript ends with the records
 Claude Code reads from the tail: an `ai-title` holding the Codex thread name, when there is one,
-and a `last-prompt` holding the last prompt the user typed.
+and a `last-prompt` holding the last prompt the user typed and naming the last record as the leaf
+to resume from.
 
 ## Provenance
 

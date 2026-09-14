@@ -8,6 +8,7 @@ struct options {
     sessionID String = ""
     codexHome String = ""
     claudeHome String = ""
+    memories bool = true
     help bool = false
 }
 
@@ -41,6 +42,11 @@ fn parseOptions(args [String]) Result<own options, failure> {
     var index usize = 0
     while index < len(args) {
         const value = text.Copy(args[index])
+        if value == "--no-memories" {
+            result.memories = false
+            index = index + 1
+            continue
+        }
         if value == "-h" || value == "--help" {
             result.help = true
             index = index + 1

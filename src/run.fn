@@ -3,7 +3,6 @@ package transcript.converter
 import std.bytes
 import std.format
 import std.fs
-import std.path
 import std.text
 
 // Codex writes whole tool outputs, images included, on one line.
@@ -26,6 +25,11 @@ struct sink {
 struct sinkOutcome {
     target own sink
     result Result<void, failure>
+}
+
+struct conversion {
+    counts tally
+    memories own memoryTracker
 }
 
 fn drain(&conv converter, &batch text.Builder) u64 {
@@ -98,6 +102,36 @@ task closeSink($target own sink) Result<void, failure> {
     .Ok
 }
 
+// Appends records to the end of an existing transcript.
+task appendText($target String, $data String) Result<void, failure> {
+    const opening = spawn fs.OpenFile($target, .Write)
+    const openedFile = $opening.wait()
+    const file = openedFile else {
+        return .Err(fault(.OutputUnavailable, "cannot open the transcript"))
+    }
+    const sizing = spawn fs.SizeFile($file)
+    const sized = $sizing.wait()
+    const fs.FileSizeOutcome { File as measured Value as length } = sized
+    const size = length else {
+        return .Err(fault(.OutputUnavailable, "cannot measure the transcript"))
+    }
+    const seeking = spawn fs.SeekFile($measured, size)
+    const sought = $seeking.wait()
+    const fs.FileOutcome { File as positioned Value as moved } = sought
+    moved else {
+        return .Err(fault(.OutputUnavailable, "cannot reach the end of the transcript"))
+    }
+    var pending = own sink { file = positioned batch = text.NewBuilder() size = 0 }
+    pending.size = text.ByteLen(data)
+    append(&pending.batch, data)
+    const closing = spawn closeSink($pending)
+    const closed = $closing.wait()
+    closed else error {
+        return .Err(error)
+    }
+    .Ok
+}
+
 // A session Codex is still writing may end in a partly written line. Only the
 // final line may fail to parse; an earlier malformed line stops the conversion.
 fn acceptLine(
@@ -130,13 +164,26 @@ fn acceptLine(
     }
 }
 
+fn useGoal(&conv converter, $goal Option<codexGoal>) void {
+    match goal {
+        None: {}
+        Some(found): {
+            const codexGoal { objective status } = found
+            conv.storedObjective = objective
+            conv.storedStatus = status
+        }
+    }
+}
+
 task convertInto(
     $source String,
     $temporary String,
     $sessionID String,
     $transcript String,
-    $title String
-) Result<tally, failure> {
+    $title String,
+    $goal Option<codexGoal>,
+    $tracker own memoryTracker
+) Result<conversion, failure> {
     const opened = fs.OpenLines(source) else {
         return .Err(fault(.SourceUnavailable, "cannot open " + source))
     }
@@ -147,6 +194,8 @@ task convertInto(
     }
     var lines = opened
     var conv = newConverter(sessionID, transcript, title)
+    conv.memories = tracker
+    useGoal(&conv, $goal)
     var target = own sink { file = file batch = text.NewBuilder() size = 0 }
     var number u64 = 0
     var reading = true
@@ -185,57 +234,6 @@ task convertInto(
     closed else error {
         return .Err(error)
     }
-    .Ok(conv.counts)
-}
-
-task run($chosen own options) Result<String, failure> {
-    const codexHome = configuredDirectory(chosen.codexHome, "CODEX_HOME", ".codex") else error {
-        return .Err(error)
-    }
-    const variable = "CLAUDE_CONFIG_DIR"
-    const claudeHome = configuredDirectory(chosen.claudeHome, variable, ".claude") else error {
-        return .Err(error)
-    }
-    const source = resolveSource(chosen.source, codexHome) else error {
-        return .Err(error)
-    }
-    const meta = readSessionMeta(source) else error {
-        return .Err(error)
-    }
-    const sessionID = if text.IsEmpty(chosen.sessionID) {
-        derivedUUID("codex/" + meta.id)
-    } else {
-        text.Copy(chosen.sessionID)
-    }
-    const output = text.Copy(chosen.output)
-    const destination = resolveDestination(output, claudeHome, meta.cwd, sessionID) else error {
-        return .Err(error)
-    }
-    prepareDestination(destination) else error {
-        return .Err(error)
-    }
-    const temporary = fs.CreateTempFile(path.Parent(destination), ".transcript-converter-") else {
-        return .Err(fault(.OutputUnavailable, "cannot create a file beside " + destination))
-    }
-    const title = threadName(codexHome, meta.id)
-    const converting = spawn convertInto(
-        text.Copy(source),
-        text.Copy(temporary),
-        text.Copy(sessionID),
-        text.Copy(destination),
-        $title
-    )
-    const converted = $converting.wait()
-    const counts = match converted {
-        Ok(value): value
-        Err(error): {
-            discard fs.RemoveFile(temporary)
-            return .Err(error)
-        }
-    }
-    fs.Rename(temporary, destination) else {
-        discard fs.RemoveFile(temporary)
-        return .Err(fault(.OutputUnavailable, "cannot publish " + destination))
-    }
-    .Ok(render(counts, source, destination, sessionID))
+    const memories = replace conv.memories with newMemoryTracker()
+    .Ok(conversion { counts = conv.counts memories = memories })
 }

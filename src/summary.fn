@@ -25,6 +25,7 @@ struct tally {
     unknown u64 = 0
     truncated u64 = 0
     metadata u64 = 0
+    goals u64 = 0
 }
 
 fn countLine(label String, value u64) String {
@@ -48,6 +49,7 @@ fn render(counts tally, source String, destination String, sessionID String) Str
         countLine("compaction boundaries", counts.compactions) +
         countLine("compaction notes", counts.summaries) +
         countLine("turn durations", counts.durations) +
+        countLine("goal records", counts.goals) +
         countLine("transcript notices", counts.notices) +
         countLine("session list records", counts.metadata) +
         "not representable in Claude\n" +
@@ -60,4 +62,12 @@ fn render(counts tally, source String, destination String, sessionID String) Str
         countLine("status events", counts.events) +
         countLine("unrecognized lines", counts.unknown) +
         countLine("incomplete final line", counts.truncated)
+}
+
+fn renderMemories(result memoryResult, directory String) String {
+    "memories into " + directory + "\n" +
+        countLine("imported", result.imported) +
+        countLine("already present", result.unchanged) +
+        countLine("kept existing file of the same name", result.kept) +
+        countLine("unreadable", result.unreadable)
 }

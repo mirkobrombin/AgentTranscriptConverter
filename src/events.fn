@@ -265,7 +265,8 @@ methods converter {
         restoreObject(&event, "goal", $goal)
         var extras = self.provenance(key)
         put(&extras, "payload", .Object(event))
-        const content = "Codex goal " + status + ": " + objective
-        self.notice($content, "info", timestamp, key, $extras)
+        self.goalObjective = text.Copy(objective)
+        self.goalStatus = text.Copy(status)
+        self.goalRecord(objective, status, timestamp, key, $extras)
     }
 }

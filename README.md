@@ -6,8 +6,9 @@ A converter that turns [Codex](https://github.com/openai/codex) sessions into
 
 The whole conversation is carried over, not a summary of it. A converted session keeps every
 prompt, assistant message, tool call with its complete input and output, image, readable reasoning
-summary, interruption, goal change, turn duration, and compaction. The Codex rollout is opened for
-reading only.
+summary, interruption, turn duration, and compaction. Its goal stays armed in Claude Code's goal
+mode, and the Codex memories it used become Claude Code memories of the project. The Codex rollout
+is opened for reading only.
 
 | Codex | Claude Code |
 |---|---|
@@ -17,11 +18,14 @@ reading only.
 | Tool call and its output | `tool_use` and matching `tool_result`, images included |
 | Command, file change, search and MCP activity inside a call | Kept with the tool result |
 | Compaction | Compaction boundary followed by the history Codex kept |
+| Thread goal | Goal re-armed by `claude --resume` while Codex had not completed it |
+| Memory files the session used | Project memories listed in `MEMORY.md` |
 
 ## Requirements
 
 - A Foundation compiler (`foundationc`), which needs LLVM 21
 - Claude Code, to resume the converted session
+- `sqlite3`, optional, to read the goal state Codex keeps in its database
 
 ## Build & Install
 
@@ -47,9 +51,13 @@ cd /path/the/session/ran/in
 claude --resume <claude session id>
 ```
 
-`--output` writes to another file, `--session-id` chooses the Claude session id, and
-`--codex-home` and `--claude-home` replace `$CODEX_HOME` (`~/.codex`) and `$CLAUDE_CONFIG_DIR`
-(`~/.claude`).
+`--output` writes to another file, `--session-id` chooses the Claude session id,
+`--no-memories` leaves the project memory alone, and `--codex-home` and `--claude-home` replace
+`$CODEX_HOME` (`~/.codex`) and `$CLAUDE_CONFIG_DIR` (`~/.claude`).
+
+Running the converter again on a session that was already converted never rewrites the
+transcript. It brings the goal and the memories up to date, so close the session in Claude Code
+first.
 
 The mapping, the limits, and the guarantees are described in
 [docs/conversion.md](docs/conversion.md).

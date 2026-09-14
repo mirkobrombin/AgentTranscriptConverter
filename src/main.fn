@@ -5,7 +5,7 @@ import std.io
 fn usage() String {
     "usage:\n" +
         "  transcript-converter <codex-rollout.jsonl | codex-session-id> [--output path]\n" +
-        "      [--session-id uuid] [--codex-home path] [--claude-home path]\n"
+        "      [--session-id uuid] [--codex-home path] [--claude-home path] [--no-memories]\n"
 }
 
 fn printFailure(value failure) void {

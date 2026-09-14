@@ -27,6 +27,13 @@ struct converter {
     transcript String
     title String
     lastPrompt String = ""
+    goalObjective String = ""
+    goalStatus String = ""
+    storedObjective String = ""
+    storedStatus String = ""
+    goalKey String = "goal"
+    lastTimestamp String = ""
+    memories own memoryTracker
     cwd String = ""
     branch String = ""
     model String = ""
@@ -54,6 +61,7 @@ fn newConverter(sessionID String, transcript String, title String) own converter
         output = collections.NewQueue<String>()
         pending = collections.NewQueue<pendingBlock>()
         callItems = json.NewArray()
+        memories = newMemoryTracker()
         counts = tally {}
     }
 }
@@ -65,8 +73,12 @@ methods converter {
         }
         var source = parsed
         self.counts.lines += 1
+        self.memories.Observe(line)
         const kind = takeText(&source, "type")
         const timestamp = takeText(&source, "timestamp")
+        if !text.IsEmpty(timestamp) {
+            self.lastTimestamp = text.Copy(timestamp)
+        }
         var body = takeObject(&source, "payload")
         const key = format.U64(number)
         if kind == "response_item" return self.item($body, timestamp, key)
@@ -88,6 +100,9 @@ methods converter {
     // the first typed prompt out of the head the session list reads.
     fn Finish(&self) Result<void, failure> {
         self.flush() else error {
+            return .Err(error)
+        }
+        self.finalGoal() else error {
             return .Err(error)
         }
         if !text.IsEmpty(self.title) {

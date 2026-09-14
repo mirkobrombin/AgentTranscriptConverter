@@ -1,0 +1,179 @@
+package transcript.converter
+
+import std.fs
+import std.path
+import std.text
+
+struct outcome {
+    report String
+    memories own memoryTracker
+}
+
+fn memoryDirectory(claudeHome String, cwd String) Result<String, failure> {
+    const folder = projectFolder(cwd) else error {
+        return .Err(error)
+    }
+    const projects = path.Join(claudeHome, "projects")
+    .Ok(path.Join(path.Join(projects, folder), "memory"))
+}
+
+// Prefers the goal database state and falls back to the rollout's last goal event.
+fn chooseGoal($stored Option<codexGoal>, $objective String, $status String) Option<codexGoal> {
+    match stored {
+        Some(found): .Some(found)
+        None: {
+            if text.IsEmpty(objective) return .None
+            .Some(codexGoal { objective = objective status = status })
+        }
+    }
+}
+
+task convertNew(
+    $source String,
+    $destination String,
+    $sessionID String,
+    $title String,
+    $goal Option<codexGoal>,
+    $tracker own memoryTracker
+) Result<outcome, failure> {
+    prepareDestination(destination) else error {
+        return .Err(error)
+    }
+    const temporary = fs.CreateTempFile(path.Parent(destination), ".transcript-converter-") else {
+        return .Err(fault(.OutputUnavailable, "cannot create a file beside " + destination))
+    }
+    const converting = spawn convertInto(
+        text.Copy(source),
+        text.Copy(temporary),
+        text.Copy(sessionID),
+        text.Copy(destination),
+        $title,
+        $goal,
+        $tracker
+    )
+    const converted = $converting.wait()
+    const result = match converted {
+        Ok(value): value
+        Err(error): {
+            discard fs.RemoveFile(temporary)
+            return .Err(error)
+        }
+    }
+    fs.Rename(temporary, destination) else {
+        discard fs.RemoveFile(temporary)
+        return .Err(fault(.OutputUnavailable, "cannot publish " + destination))
+    }
+    const conversion { counts memories } = result
+    .Ok(outcome { report = render(counts, source, destination, sessionID) memories = memories })
+}
+
+task updateOld(
+    $source String,
+    $destination String,
+    $sessionID String,
+    $codexID String,
+    $cwd String,
+    $claudeHome String,
+    $stored Option<codexGoal>,
+    $tracker own memoryTracker
+) Result<outcome, failure> {
+    const scanned = scanRollout(source, $tracker) else error {
+        return .Err(error)
+    }
+    const rolloutScan { memories objective status } = scanned
+    const goal = chooseGoal($stored, $objective, $status)
+    const updating = spawn updateExisting(
+        $destination,
+        $sessionID,
+        $codexID,
+        $cwd,
+        $claudeHome,
+        $goal
+    )
+    const updated = $updating.wait()
+    const report = updated else error {
+        return .Err(error)
+    }
+    .Ok(outcome { report = report memories = memories })
+}
+
+fn completed(
+    $result outcome,
+    enabled bool,
+    codexHome String,
+    claudeHome String,
+    cwd String,
+    codexID String
+) Result<String, failure> {
+    const outcome { report memories } = result
+    if !enabled return .Ok(report)
+    const directory = memoryDirectory(claudeHome, cwd) else error {
+        return .Ok(report + "memories not imported: " + error.message + "\n")
+    }
+    var used = memories
+    const imported = migrateMemories(&used, codexHome, directory, codexID) else error {
+        return .Err(error)
+    }
+    .Ok(report + renderMemories(imported, directory))
+}
+
+task run($chosen own options) Result<String, failure> {
+    const codexHome = configuredDirectory(chosen.codexHome, "CODEX_HOME", ".codex") else error {
+        return .Err(error)
+    }
+    const variable = "CLAUDE_CONFIG_DIR"
+    const claudeHome = configuredDirectory(chosen.claudeHome, variable, ".claude") else error {
+        return .Err(error)
+    }
+    const source = resolveSource(chosen.source, codexHome) else error {
+        return .Err(error)
+    }
+    const meta = readSessionMeta(source) else error {
+        return .Err(error)
+    }
+    const sessionID = if text.IsEmpty(chosen.sessionID) {
+        derivedUUID("codex/" + meta.id)
+    } else {
+        text.Copy(chosen.sessionID)
+    }
+    const output = text.Copy(chosen.output)
+    const destination = resolveDestination(output, claudeHome, meta.cwd, sessionID) else error {
+        return .Err(error)
+    }
+    const stored = goalFromStore(codexHome, meta.id)
+    const tracker = listMemories(codexHome)
+    const exists = fs.Exists(destination) else {
+        return .Err(fault(.OutputUnavailable, "cannot inspect " + destination))
+    }
+    if exists {
+        const updating = spawn updateOld(
+            text.Copy(source),
+            text.Copy(destination),
+            text.Copy(sessionID),
+            text.Copy(meta.id),
+            text.Copy(meta.cwd),
+            text.Copy(claudeHome),
+            $stored,
+            $tracker
+        )
+        const updated = $updating.wait()
+        const result = updated else error {
+            return .Err(error)
+        }
+        return completed($result, chosen.memories, codexHome, claudeHome, meta.cwd, meta.id)
+    }
+    const title = threadName(codexHome, meta.id)
+    const converting = spawn convertNew(
+        text.Copy(source),
+        text.Copy(destination),
+        text.Copy(sessionID),
+        $title,
+        $stored,
+        $tracker
+    )
+    const converted = $converting.wait()
+    const result = converted else error {
+        return .Err(error)
+    }
+    completed($result, chosen.memories, codexHome, claudeHome, meta.cwd, meta.id)
+}

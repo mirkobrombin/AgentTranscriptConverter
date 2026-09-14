@@ -1,0 +1,91 @@
+package transcript.converter
+
+import std.text
+
+fn goalLine(status String) String {
+    "{\"timestamp\":\"t8\",\"type\":\"event_msg\",\"payload\":{\"type\":" +
+        "\"thread_goal_updated\",\"goal\":{\"objective\":\"ship it\",\"status\":\"" + status +
+        "\"}}}"
+}
+
+test "codex goal states map onto claude goal records" {
+    var armed = goalAttachment("ship it", "usage_limited")
+    expect(!takeBool(&armed, "met"))
+    expect(takeBool(&armed, "sentinel"))
+    var paused = goalAttachment("ship it", "paused")
+    expect(takeBool(&paused, "met"))
+    expect(takeBool(&paused, "sentinel"))
+    var complete = goalAttachment("ship it", "complete")
+    expect(takeBool(&complete, "met"))
+    expect(!takeBool(&complete, "sentinel"))
+    expect(takeText(&complete, "condition") == "ship it")
+}
+
+test "the stored goal closes the conversation before the session list records" {
+    const id = "00000000-0000-8000-8000-000000000000"
+    var conv = newConverter(id, "/out/session.jsonl", "")
+    conv.storedObjective = "ship it"
+    conv.storedStatus = "usage_limited"
+    feed(&conv, sessionLine(), 1)
+    feed(&conv, userLine("user.text", "go"), 2)
+    feed(&conv, goalLine("active"), 3)
+    conv.Finish() else {
+        fail("finish failed")
+    }
+    var notice = nextRecord(&conv)
+    discard notice
+    var prompt = nextRecord(&conv)
+    discard prompt
+    var event = nextRecord(&conv)
+    expect(takeText(&event, "type") == "attachment")
+    var closingGoal = nextRecord(&conv)
+    const goalUuid = takeText(&closingGoal, "uuid")
+    var attachment = takeObject(&closingGoal, "attachment")
+    expect(takeText(&attachment, "type") == "goal_status")
+    expect(!takeBool(&attachment, "met"))
+    var last = nextRecord(&conv)
+    expect(takeText(&last, "type") == "last-prompt")
+    expect(takeText(&last, "leafUuid") == goalUuid)
+}
+
+test "memory names follow their codex paths" {
+    expect(memorySlug("AMUS_ARCHITECTURE.md") == "codex-amus-architecture")
+    expect(memorySlug("team/MEMORY.md") == "codex-team-memory")
+    expect(memoryTitle("# Server Index\n\nbody", "x") == "Server Index")
+    expect(memoryTitle("intro\n# Later\n", "x") == "Later")
+    expect(memoryTitle("no heading", "fallback") == "fallback")
+    const document = memoryDocument("codex-a", "A", "/m/A.md", "s1", "# A\n")
+    expect(text.StartsWith(document, "---\nname: codex-a\ndescription: \"A (Codex memory"))
+    expect(text.EndsWith(document, "`/m/A.md`.\n\n# A\n"))
+}
+
+test "only memories named by tool calls count as used" {
+    var listing = newMemoryTracker()
+    listing.candidates.Enqueue("INDEX.md")
+    listing.Observe(
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\"," +
+        "\"output\":\"grep: memories/INDEX.md\"}}"
+    )
+    expect(listing.used.Len() == 0)
+    var tracker = newMemoryTracker()
+    tracker.candidates.Enqueue("NOTES.md")
+    tracker.candidates.Enqueue("OTHER.md")
+    tracker.Observe(
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"text\":" +
+        "\"memories/OTHER.md\"}}"
+    )
+    tracker.Observe(
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"input\":" +
+        "\"cat ~/.codex/memories/NOTES.md\"}}"
+    )
+    tracker.Observe(
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\"," +
+        "\"output\":\"memories/NOTES.md\"}}"
+    )
+    expect(tracker.used.Len() == 1)
+    const first = tracker.used.Dequeue()
+    match first {
+        None: fail("no memory was marked")
+        Some(value): expect(value == "NOTES.md")
+    }
+}

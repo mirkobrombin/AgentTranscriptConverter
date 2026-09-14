@@ -1,0 +1,128 @@
+package transcript.converter
+
+import std.json
+import std.path
+import std.process
+import std.text
+
+struct codexGoal {
+    objective String
+    status String
+}
+
+// Claude Code re-arms a goal on resume from the last goal_status record of the
+// loaded conversation when that record is neither met nor failed. Codex also
+// stops a goal for quota reasons, so a goal limited by usage or budget stays
+// armed. A paused or blocked goal is recorded the way `/goal clear` records it.
+fn goalArmed(status String) bool {
+    status == "active" || status == "usage_limited" || status == "budget_limited"
+}
+
+fn goalAttachment(objective String, status String) own json.Object {
+    var attachment = json.NewObject()
+    put(&attachment, "type", .Text("goal_status"))
+    put(&attachment, "met", .Bool(!goalArmed(status)))
+    if status != "complete" {
+        put(&attachment, "sentinel", .Bool(true))
+    }
+    put(&attachment, "condition", .Text(text.Copy(objective)))
+    attachment
+}
+
+fn firstGoal($rows own json.Array) Option<codexGoal> {
+    var list = rows
+    const first = list.PopFront()
+    match first {
+        None: .None
+        Some(value): {
+            var row = objectOf($value)
+            const objective = takeText(&row, "objective")
+            if text.IsEmpty(objective) return .None
+            .Some(codexGoal { objective = objective status = takeText(&row, "status") })
+        }
+    }
+}
+
+// Codex keeps thread goals in a SQLite database whose state can be newer than
+// the last goal event of the rollout. It is read through the sqlite3 program
+// when that program is installed.
+fn goalFromStore(codexHome String, id String) Option<codexGoal> {
+    const database = path.Join(codexHome, "goals_1.sqlite")
+    if !isRegularFile(database) return .None
+    const thread = UUID.Parse(id) else {
+        return .None
+    }
+    const query = "select objective, status from thread_goals where thread_id = '" +
+        thread.String() + "'"
+    const options = process.Options {
+        WorkingDirectory = .None
+        InheritEnvironment = true
+        OutputLimit = 16777216
+    }
+    const arguments = [
+        text.Copy("-readonly"),
+        text.Copy("-json"),
+        text.Copy(database),
+        text.Copy(query)
+    ]
+    const environment [0]String = []
+    const ran = process.Run("sqlite3", arguments, environment, $options) else {
+        return .None
+    }
+    if ran.ExitCode != 0 return .None
+    const output = ran.StdoutText() else {
+        return .None
+    }
+    const parsed = json.Parse(output) else {
+        return .None
+    }
+    match parsed {
+        Array(rows): firstGoal($rows)
+        _: .None
+    }
+}
+
+methods converter {
+    fn goalRecord(
+        &self,
+        objective String,
+        status String,
+        timestamp String,
+        key String,
+        $extras own json.Object
+    ) Result<void, failure> {
+        self.flush() else error {
+            return .Err(error)
+        }
+        var line = self.opening("attachment")
+        line.value("attachment", .Object(goalAttachment(objective, status))) else error {
+            return .Err(error)
+        }
+        self.counts.goals += 1
+        const uuid = self.uuidFor(key)
+        self.closing(&line, uuid, timestamp, $extras)
+    }
+
+    // The final goal state closes the conversation, after the last compaction
+    // boundary, where Claude Code looks for it on resume.
+    fn finalGoal(&self) Result<void, failure> {
+        const stored = !text.IsEmpty(self.storedObjective)
+        const objective = if stored {
+            text.Copy(self.storedObjective)
+        } else {
+            text.Copy(self.goalObjective)
+        }
+        if text.IsEmpty(objective) return .Ok
+        const status = if stored {
+            text.Copy(self.storedStatus)
+        } else {
+            text.Copy(self.goalStatus)
+        }
+        const key = text.Copy(self.goalKey)
+        const timestamp = text.Copy(self.lastTimestamp)
+        var extras = self.provenance(key)
+        put(&extras, "status", .Text(text.Copy(status)))
+        put(&extras, "source", .Text("goals database" if stored else "rollout"))
+        self.goalRecord(objective, status, timestamp, key, $extras)
+    }
+}
